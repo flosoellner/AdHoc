@@ -1,7 +1,8 @@
 import numpy as np
+import torch
 
 from .base import BaseOCP, cheb
-from models import LQR
+from controls.lqr import LQR
 
 class BurgersOCP(BaseOCP):
     """Burgers equation optimal control problem."""
@@ -11,7 +12,7 @@ class BurgersOCP(BaseOCP):
         n_states = config.n_states
         n_controls = config.n_controls
         # Burgers-specific parameters
-        self.nu = 0.02
+        self.nu = 0.01
         self.gamma = 0.1
         self.R = 0.5
         kappa = 25.
@@ -192,6 +193,69 @@ class BurgersOCP(BaseOCP):
 
         return np.vstack((dXdt, dAdt, -L))
 
+    def _torch_params(self, device=None, dtype=torch.float32):
+        device = device or torch.device("cpu")
+        return {
+            "D": torch.tensor(self.D, dtype=dtype, device=device),
+            "D2": torch.tensor(self.D2, dtype=dtype, device=device),
+            "B": torch.tensor(self.B, dtype=dtype, device=device),
+            "alpha": torch.tensor(self.alpha_flat, dtype=dtype, device=device),
+            "w": torch.tensor(self.w_flat, dtype=dtype, device=device),
+            "R": torch.tensor(self.R, dtype=dtype, device=device),
+            "nu": float(self.nu),
+            "gamma": float(self.gamma),
+        }
+
+    def physics_module(self):
+        return BurgersPhysics(self) 
+
+    def dynamics(self, X, U):
+        """NumPy version for ODE solvers/LSODA."""
+        flat_out = X.ndim < 2
+        X = X.reshape(self.n_states, -1)
+        U = U.reshape(self.n_controls, -1)
+
+        dXdt = (
+            -0.5 * (self.D @ X**2)
+            + (self.nu * self.D2) @ X
+            + X * self.alpha * np.exp(-self.gamma * X)
+            + self.B @ U
+        )
+        return dXdt.flatten() if flat_out else dXdt
+
+    def torch_dynamics(self, x, u):
+        return self.physics_module.dynamics(x, u)
+
+    def torch_running_cost(self, x, u):
+        return self.physics_module.running_cost(x, u)
 
 
+class BurgersPhysics(torch.nn.Module):
+    def __init__(self, ocp): # Pass the OCP object directly
+        super().__init__()
+        # register_buffer ensures these move to GPU/CPU automatically
+        self.register_buffer("D", torch.from_numpy(ocp.D).float())
+        self.register_buffer("D2", torch.from_numpy(ocp.D2).float())
+        self.register_buffer("B", torch.from_numpy(ocp.B).float())
+        self.register_buffer("alpha", torch.from_numpy(ocp.alpha).float())
+        self.register_buffer("w", torch.from_numpy(ocp.w_flat).float())
 
+        self.R_val = float(ocp.R)
+        self.nu = float(ocp.nu)
+        self.gamma = float(ocp.gamma)
+
+    def get_control(self, dVdX: torch.Tensor) -> torch.Tensor:
+        u = -(0.5 / self.R_val) * (dVdX @ self.B)
+        return torch.clamp(u, -0.5, 0.5)
+
+    def dynamics(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        x_T = x.t()
+        # Convection + Diffusion + Forcing + Control
+        f = (-0.5 * (self.D @ (x_T**2)) + 
+             self.nu * (self.D2 @ x_T) + 
+             x_T * self.alpha * torch.exp(-self.gamma * x_T) + 
+             self.B @ u.t())
+        return f.t()
+
+    def running_cost(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        return (self.w * (x**2)).sum(dim=1) + self.R_val * (u**2).sum(dim=1)

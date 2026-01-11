@@ -1,6 +1,6 @@
 import numpy as np
 
-def sample_conditions(config, n: int, seed: int = None, dist: float = None):
+def sample_conditions(config, n: int, dist: float = None, seed: int = None, K: int = 10):
     """
     Sample initial conditions using sum of sine functions.
     
@@ -51,3 +51,42 @@ def sample_conditions(config, n: int, seed: int = None, dist: float = None):
     
     # Return as (n, d)
     return X0
+
+def adaptive_sample_conditions(
+    config,
+    n: int,
+    *,
+    controller,
+    n_candidates: int = 2,
+    dist: float | None = None,
+    seed: int | None = None,
+    device: str = "cpu",
+):
+    """
+    Sample `n_candidates` using `sample_conditions`, score by ||dVdX||, return top-n.
+
+    controller can be:
+    - LQR: has .eval_dVdX(X) with X shaped (d,N) numpy
+    - NN Control with GradNet: pass ctrl (has .grad_net torch module)
+    """
+    Xcand = sample_conditions(config, n_candidates*n, seed=seed, dist=dist)  # (d,N)
+
+    # get gradients (d,N)
+    if hasattr(controller, "eval_dVdX"):
+        G = controller.eval_dVdX(Xcand)
+    elif hasattr(controller, "grad_net"):
+        import torch
+        x = torch.tensor(Xcand.T, dtype=torch.float32, device=device)  # (N,d)
+        with torch.no_grad():
+            G = controller.grad_net(x).detach().cpu().numpy().T        # (d,N)
+    elif callable(controller):
+        import torch
+        x = torch.tensor(Xcand.T, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            G = controller(x).detach().cpu().numpy().T   # (d,N)
+    else:
+        raise TypeError("controller must have eval_dVdX (LQR) or grad_net (NN Control).")
+
+    scores = np.linalg.norm(G, axis=0)
+    idx = np.argsort(scores)[::-1][:n]
+    return Xcand[:, idx], scores[idx]

@@ -337,7 +337,7 @@ def solve_ivp(
 
 def sim_closed_loop(
         dynamics, jacobian, controller, tspan, X0, t_eval=None, events=None,
-        solver='RK45', atol=1e-06, rtol=1e-03
+        solver='LSODA', atol=1e-06, rtol=1e-03
     ):
     '''
     Simulate the closed-loop system for a fixed time interval.
@@ -362,11 +362,11 @@ def sim_closed_loop(
         U = controller.eval_U(X)
         return dynamics(X, U)
 
-    def jac_wrapper(t, X):
-        return jacobian(X, controller)
+    #def jac_wrapper(t, X):
+        #eturn jacobian(X, controller)
 
     ode_sol = solve_ivp(
-        dynamics_wrapper, tspan, X0, t_eval=t_eval, jac=jac_wrapper,
+        dynamics_wrapper, tspan, X0, t_eval=t_eval, jac=None,
         events=events, vectorized=True, method=solver, rtol=rtol, atol=atol
     )
 

@@ -1,7 +1,6 @@
 import numpy as np
 from scipy.linalg import solve_continuous_are as care
 
-
 class LQR:
     '''
     Linear quadratic regulator (LQR) controller.
@@ -72,27 +71,4 @@ class LQR:
         return XPX, PX, U
 
 
-class LQRController:
-    '''
-    Wrapper for LQR to work with ProblemConfig interface.
-    '''
-    def __init__(self, config):
-        if hasattr(config, 'ocp') and hasattr(config.ocp, 'LQR'):
-            self.lqr = config.ocp.LQR
-        elif hasattr(config, 'LQR'):
-            self.lqr = config.LQR
-        else:
-            raise AttributeError("config must have LQR attribute")
-        self.config = config
 
-    def control(self, x):
-        '''Control input U(x)'''
-        return self.lqr.control(x)
-
-    def value_gradient(self, x):
-        '''Value gradient dV/dX(x)'''
-        return self.lqr.value_gradient(x)
-
-    def Vx(self, x):
-        '''Value gradient dV/dX(x)'''
-        return self.lqr.Vx(x)

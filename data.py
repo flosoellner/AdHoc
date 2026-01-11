@@ -3,6 +3,7 @@ import warnings
 import numpy as np
 from scipy.interpolate import interp1d
 import sampling
+from tables import save_keyval_table_tex_2row
 
 import simulation
 
@@ -71,7 +72,7 @@ def generate(
     def open_converged(X, U):
         return OCP.running_cost(X, U) < config.fp_tol
 
-    X0_pool = sampling.sample_conditions(config,n_trajectories).reshape(OCP.n_states, -1)
+    X0_pool = sampling.sample_conditions(config, n_trajectories, seed=config.seed).reshape(OCP.n_states, -1)
 
     n_attempt = 0
     n_sol = 0
@@ -166,7 +167,8 @@ def generate(
 
                 # Resample the failed initial condition
                 if resolve_failed:
-                    X0_pool[:,n_sol] = OCP.sample_X0(1)
+                    X0_new = sampling.sample_conditions(config, 1, seed=None)
+                    X0_pool[:,n_sol] = X0_new.T  # or X0_new.T if needed
 
             if verbose:
                 for header in _headers:
@@ -183,3 +185,66 @@ def generate(
     sol_time, fail_time = np.sum(sol_time), np.sum(fail_time)
 
     return data, n_attempt, n_fail, sol_time, fail_time
+
+
+
+import os, json, hashlib
+import torch
+import numpy as np
+
+def _fingerprint(config, n_trajectories, controller):
+    ctrl_name = controller.__class__.__name__ if controller is not None else "None"
+
+    payload = dict(
+        system=config.system,
+        seed=config.seed,
+        n_states=config.n_states,
+        n_controls=config.n_controls,
+        n_trajectories=int(n_trajectories),
+
+        ocp_solver=config.ocp_solver,
+        t1_initial=config.t1_initial,
+        t1_scale=config.t1_scale,
+        t1_max=config.t1_max,
+        fp_tol=config.fp_tol,
+        direct_n_init_nodes=config.direct_n_init_nodes,
+        indirect_tol=config.indirect_tol,
+        indirect_max_nodes=config.indirect_max_nodes,
+
+        controller=ctrl_name,
+    )
+    s = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha1(s).hexdigest(), payload
+
+
+def load_or_generate(config, n_trajectories, *, controller=None, cache_dir=None, force_regen=False, **kwargs):
+    if cache_dir is None:
+        cache_dir = f"./cache_seed{config.seed}/data"
+    os.makedirs(cache_dir, exist_ok=True)
+
+    key, meta = _fingerprint(config, n_trajectories, controller)
+    path = os.path.join(cache_dir, f"pmp_{key}.npz")
+
+    if (not force_regen) and os.path.exists(path):
+        z = np.load(path, allow_pickle=True)
+        dataset = {k: z[k] for k in z.files if k != "__meta__"}
+        meta_loaded = json.loads(str(z["__meta__"]))
+        return dataset, meta_loaded
+
+    dataset, n_attempt, n_fail, sol_time, fail_time = generate(
+        config.ocp, config, n_trajectories,
+        controller=controller,
+        **kwargs
+    )
+
+    meta_out = dict(
+        **meta,
+        n_attempt=int(n_attempt),
+        n_fail=int(n_fail),
+        sol_time=float(sol_time),
+        fail_time=float(fail_time),
+    )
+
+    np.savez_compressed(path, **dataset, __meta__=json.dumps(meta_out))
+    return dataset, meta_out
+

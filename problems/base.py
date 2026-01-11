@@ -7,7 +7,33 @@ from scipy.optimize._numdiff import approx_derivative
 from scipy import sparse
 
 
+def u_analytic(Vx: np.ndarray, config) -> np.ndarray:
+    """
+    Compute optimal control from value gradient using PMP.
+    
+    Parameters:
+    -----------
+    Vx : array, shape (d,)
+        Value gradient (costate)
+    config : config-like object
+        Must have: q (control penalty scalar or array), B (control matrix)
+        
+    Returns:
+    --------
+    u_optimal : array, shape (m,)
+        Optimal control
+    """
+    q = config.q
+    B = config.B
 
+    m = B.shape[1]
+    if np.isscalar(q):
+        R_inv = np.eye(m) / (2.0 * q)
+    else:
+        R_inv = np.diag(1.0 / (2.0 * np.asarray(q).flatten()))
+    u_optimal = -R_inv @ (B.T @ Vx)
+
+    return u_optimal
 
 def find_fixed_point(OCP, controller, tol, X0=None, verbose=True):
     '''
@@ -472,18 +498,13 @@ class BaseOCP:
 
         return approx_derivative(self.constraint_fun, X, f0=C0)
 
-    def make_integration_events(self):
-        '''
-        Construct a (list of) callables that are tracked during integration for
-        times at which they cross zero. Such events can terminate integration
-        early.
+    def make_integration_events(self, x_max=4.0):
+        import numpy as np
 
-        Returns
-        -------
-        events : None, callable, or list of callables
-            Each callable has a function signature e = event(t, X). If the ODE
-            integrator finds a sign change in e then it searches for the time t
-            at which this occurs. If event.terminal = True then integration
-            stops.
-        '''
-        return None
+        def explosion_event(t, X):
+            # X comes in as (n_states,) for solve_ivp with vectorized=False
+            return np.max(np.abs(X)) - x_max
+
+        explosion_event.terminal = True
+        explosion_event.direction = 1
+        return [explosion_event]
