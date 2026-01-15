@@ -1,0 +1,32 @@
+## Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+## macOS
+.DS_Store
+
+## Jupyter
+.ipynb_checkpoints/
+
+## Local caches / generated data
+cache_*/
+cache_seed*/
+cache_seed*/**
+cache_hard_ics/
+
+## Trained models / checkpoints
+saved_models/
+*.pt
+*.pth
+
+## Generated figures
+figures/
+*.pdf
+*.png
+
+## Thesis outputs (generated tables etc.)
+thesis/tables/
+

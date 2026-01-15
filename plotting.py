@@ -15,6 +15,58 @@ from simulation import sim_closed_loop
 # Styling helpers
 # ---------------------------------------------------------------------
 
+def _iter_named_controllers(controllers):
+    """
+    Normalize a controllers collection into an iterator of (name, controller).
+
+    Accepts:
+      - list/tuple of (name, controller) OR (controller, name)
+      - dict {name: controller}
+      - list of controller objects (names auto-derived)
+    """
+    if isinstance(controllers, dict):
+        items = list(controllers.items())
+    else:
+        items = list(controllers)
+
+    def _looks_like_controller(obj) -> bool:
+        return (
+            hasattr(obj, "eval_U")
+            or hasattr(obj, "eval_V")
+            or hasattr(obj, "eval_dVdX")
+            or hasattr(obj, "grad_net")
+        )
+
+    for item in items:
+        # bare controller object
+        if not (isinstance(item, (tuple, list)) and len(item) == 2):
+            ctrl = item
+            name = getattr(ctrl, "__name__", ctrl.__class__.__name__)
+            yield str(name), ctrl
+            continue
+
+        a, b = item
+
+        # Prefer a string as the name.
+        if isinstance(a, str) and not isinstance(b, str):
+            yield a, b
+            continue
+        if isinstance(b, str) and not isinstance(a, str):
+            yield b, a
+            continue
+
+        # Otherwise choose the side that "looks like a controller".
+        a_is_ctrl = _looks_like_controller(a)
+        b_is_ctrl = _looks_like_controller(b)
+        if a_is_ctrl and not b_is_ctrl:
+            yield str(b), a
+        elif b_is_ctrl and not a_is_ctrl:
+            yield str(a), b
+        else:
+            # fall back: treat first as name-like, second as controller-like
+            yield str(a), b
+
+
 def _is_lqr(name, obj) -> bool:
     # Kept for backward compatibility (no longer used for styling).
     if "lqr" in str(name).lower():
@@ -117,7 +169,7 @@ def plot_value_slice(
         xlabel = rf"$x_{{{i}}}$ (slice; other components $0$)"
 
     fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
-    for k, (name, ctrl) in enumerate(controllers):
+    for k, (name, ctrl) in enumerate(_iter_named_controllers(controllers)):
         V = _value_from_controller_or_gradnet(ctrl, X, device=device, n_quad=n_quad)
         ax.plot(s, V, label=str(name))
 
@@ -156,7 +208,7 @@ def plot_value_vs_state_norm(
     xnorm = np.asarray(config.ocp.norm(X)).reshape(-1)
 
     fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
-    for k, (name, ctrl) in enumerate(controllers):
+    for k, (name, ctrl) in enumerate(_iter_named_controllers(controllers)):
         V = _value_from_controller_or_gradnet(ctrl, X, device=device, n_quad=n_quad)
 
 
@@ -360,17 +412,25 @@ def plot_hjb_residual_shock_line(
             return torch.tensor(G.T, dtype=X.dtype, device=X.device)       # (B,d)
 
     def _as_grad_model(obj):
-        # If it's an LQR controller, wrap as model; if it's a GradNet, use as-is.
-        if hasattr(obj, "eval_dVdX"):   # LQR
+        # If it's an LQR controller, wrap as model.
+        if hasattr(obj, "eval_dVdX"):
             return _LQRAsGradModel(config)
+
+        # If it's a policy wrapper (Control), unwrap to its grad_net if present.
+        if hasattr(obj, "grad_net") and (obj.grad_net is not None):
+            obj = obj.grad_net
+
         # assume it's a torch model like GradNet with .config
         if not hasattr(obj, "config"):
-            raise ValueError("For non-LQR, pass the GradNet itself (e.g. ctrl1.grad_net), not Control().")
+            raise ValueError(
+                "For non-LQR, pass the GradNet itself (e.g. ctrl.grad_net or model), "
+                "not a string or a controller without gradient information."
+            )
         return obj
 
     fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
 
-    for k, (name, obj) in enumerate(controllers):
+    for k, (name, obj) in enumerate(_iter_named_controllers(controllers)):
         model = _as_grad_model(obj)
         ys = []
         for s in s_grid:
@@ -464,7 +524,7 @@ def plot_value_flow(
 
     fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
 
-    for k, (name, ctrl) in enumerate(controllers):
+    for k, (name, ctrl) in enumerate(_iter_named_controllers(controllers)):
         # simulate closed loop
         t, X, status = sim_closed_loop(
             config.ocp.dynamics,

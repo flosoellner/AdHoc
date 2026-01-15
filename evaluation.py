@@ -4,6 +4,52 @@ import os, json, hashlib
 from simulation import sim_closed_loop
 from sampling import sample_conditions
 
+
+def iter_named_controllers(controllers):
+    """
+    Normalize a controllers collection into an iterator of (name, controller).
+
+    Accepts:
+      - list/tuple of (name, controller) OR (controller, name)
+      - dict {name: controller}
+      - list of controller objects (names auto-derived)
+    """
+    if isinstance(controllers, dict):
+        items = list(controllers.items())
+    else:
+        items = list(controllers)
+
+    def _looks_like_controller(obj) -> bool:
+        return hasattr(obj, "eval_U")
+
+    for item in items:
+        # bare controller object
+        if not (isinstance(item, (tuple, list)) and len(item) == 2):
+            ctrl = item
+            name = getattr(ctrl, "__name__", ctrl.__class__.__name__)
+            yield str(name), ctrl
+            continue
+
+        a, b = item
+
+        # Prefer a string as the name.
+        if isinstance(a, str) and not isinstance(b, str):
+            yield a, b
+            continue
+        if isinstance(b, str) and not isinstance(a, str):
+            yield b, a
+            continue
+
+        # Otherwise choose the side that "looks like a controller".
+        a_is_ctrl = _looks_like_controller(a)
+        b_is_ctrl = _looks_like_controller(b)
+        if a_is_ctrl and not b_is_ctrl:
+            yield str(b), a
+        elif b_is_ctrl and not a_is_ctrl:
+            yield str(a), b
+        else:
+            yield str(a), b
+
 def rollout_success(config, controller, x0, eps=1e-2):
     # Suppress specific warnings during simulation
     with warnings.catch_warnings():
@@ -146,6 +192,19 @@ def evaluate_controller(config, controller, name, X_std, X_hard):
         
 
     return results
+
+
+def evaluate_controllers(config, controllers, X_std, X_hard):
+    """
+    Convenience wrapper: evaluate a whole collection of controllers.
+
+    `controllers` may be in any of the common formats accepted by `iter_named_controllers`.
+    Returns the same flat list-of-dicts structure as `evaluate_controller`.
+    """
+    out = []
+    for name, ctrl in iter_named_controllers(controllers):
+        out.extend(evaluate_controller(config, ctrl, name, X_std, X_hard))
+    return out
 
 def _hard_ic_key(config, *, n_pool, eps, dist, seed):
     payload = dict(
