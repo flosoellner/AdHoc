@@ -1,8 +1,6 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import os
-import config
 from problems.base import u_analytic
 
 
@@ -12,6 +10,7 @@ def make_mlp(d_in, d_out, hidden=64, depth=4, act=nn.Tanh):
         layers += [nn.Linear(hidden, hidden), act()]
     layers += [nn.Linear(hidden, d_out)]
     return nn.Sequential(*layers)
+
 
 
 class TorchWrapperMixin:
@@ -31,36 +30,73 @@ class TorchWrapperMixin:
         return Y.detach().cpu().numpy().T
 
 
+class ResBlock(nn.Module):
+    def __init__(self, width, act=nn.Tanh, alpha=0.1, use_ln=False):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.ln = nn.LayerNorm(width) if use_ln else nn.Identity()
+        self.fc1 = nn.Linear(width, width)
+        self.act = act()
+        self.fc2 = nn.Linear(width, width)
+
+        # optional but nice: start near-identity
+        with torch.no_grad():
+            self.fc2.weight.zero_()
+            self.fc2.bias.zero_()
+
+    def forward(self, x):
+        y = self.ln(x)
+        y = self.fc1(y)
+        y = self.act(y)
+        y = self.fc2(y)
+        return x + self.alpha * y
+
+
+class ResMLP(nn.Module):
+    def __init__(self, d_in, d_out, hidden=64, depth=4, act=nn.Tanh, alpha=0.1, use_ln=False):
+        super().__init__()
+        self.inp = nn.Linear(d_in, hidden)
+        self.act = act()
+        self.blocks = nn.ModuleList([ResBlock(hidden, act=act, alpha=alpha, use_ln=use_ln) for _ in range(depth)])
+        self.out = nn.Linear(hidden, d_out)
+
+    def forward(self, x):
+        x = self.act(self.inp(x))
+        for b in self.blocks:
+            x = b(x)
+        return self.out(x)
+
 
 class GradNet(nn.Module, TorchWrapperMixin):
-    def __init__(self, config, hidden=64, depth=2, act=nn.Tanh, use_lqr=True):
+    def __init__(self, config, hidden=64, depth=2, act=nn.Tanh, use_lqr=True, *, residual=True, res_alpha=0.1, res_ln=False):
         super().__init__()
         self.config = config
         self.use_lqr = use_lqr
         d = config.n_states
-        self.net = make_mlp(d, d, hidden=hidden, depth=depth, act=act)
 
-    # --- FIX: ZERO INITIALIZATION ---
-        # This ensures the network starts as a "silent" addition to LQR
-        # preventing it from making things worse at epoch 0.
+        if residual:
+            self.net = ResMLP(d, d, hidden=hidden, depth=depth, act=act, alpha=res_alpha, use_ln=res_ln)
+            last = self.net.out
+        else:
+            self.net = make_mlp(d, d, hidden=hidden, depth=depth, act=act)
+            last = self.net[-1]
+
+        # silent start (keeps your "doesn't wreck LQR at epoch 0" behavior)
         with torch.no_grad():
-            self.net[-1].weight.fill_(0.0)
-            self.net[-1].bias.fill_(0.0)
+            last.weight.zero_()
+            last.bias.zero_()
 
-    def forward(self, x):  # x: (N,d)
-        # residual with QRNet constraint g_res(0)=0
+    def forward(self, x):
         g_res = self.net(x)
         g0 = self.net(x.new_zeros((1, x.shape[1])))
-        g_res = g_res - g0  # (N,d)
+        g_res = g_res - g0
 
         if not self.use_lqr:
             return g_res
 
-        # add LQR gradient baseline -> full gradient
-        X_np = x.detach().cpu().numpy().T                         # (d,N)
-        g_lqr_np = self.config.ocp.LQR.eval_dVdX(X_np)            # (d,N)
-        g_lqr = torch.tensor(g_lqr_np.T, dtype=x.dtype, device=x.device)  # (N,d)
-
+        X_np = x.detach().cpu().numpy().T
+        g_lqr_np = self.config.ocp.LQR.eval_dVdX(X_np)
+        g_lqr = torch.tensor(g_lqr_np.T, dtype=x.dtype, device=x.device)
         return g_lqr + g_res
 
 
@@ -69,7 +105,7 @@ class Control(nn.Module, TorchWrapperMixin):
     Uses analytic control from value gradient.
     Optionally adds an LQR baseline and/or uses a residual value gradient.
     """
-    def __init__(self, config, value_net=None, grad_net=None, use_autograd=True):
+    def __init__(self, config, value_net=None, grad_net=None, use_autograd=False):
         super().__init__()
         self.config = config
         self.value_net = value_net

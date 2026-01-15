@@ -10,9 +10,9 @@ import itertools
 
 @dataclass
 class TrainConfig:
-    sup_epochs: int = 10
+    sup_epochs: int = 3
     sup_lr: float = 1e-3
-    unsup_epochs: int = 10
+    unsup_epochs: int = 30
     unsup_lr: float = 1e-4
     batch_size: int = None
     device: str = "cpu"
@@ -23,9 +23,9 @@ class TrainConfig:
 
 bs_max = 256
 bs_warmup_epochs = 1
-D0 = 1.0
-C = 1
-M = 1.5
+D0 = 0.5
+C = 0.2
+M = 1.15
 
 def save_model(path, *, config, grad_net=None, value_net=None, extra=None, history=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -55,16 +55,27 @@ def load_gradnet(path, *, config, device="cpu"):
     if ckpt.get("grad_net") is None:
         raise ValueError(f"No grad_net weights in checkpoint: {path}")
 
-    grad_net = GradNet(config).to(device)
     sd = ckpt["grad_net"]
     sd = {k: v for k, v in sd.items() if not k.startswith("_physics.")}
+
+    # Backward compatibility:
+    # - older checkpoints: plain nn.Sequential MLP -> "net.0.*", "net.2.*", ...
+    # - current default: residual net -> "net.inp.*", "net.blocks.*", "net.out.*"
+    has_sequential_style = any(k.startswith("net.0.") for k in sd.keys())
+    has_resmlp_style = any(k.startswith("net.inp.") for k in sd.keys())
+
+    if has_sequential_style and (not has_resmlp_style):
+        grad_net = GradNet(config, residual=False).to(device)
+    else:
+        grad_net = GradNet(config).to(device)
+
     grad_net.load_state_dict(sd, strict=True)
     grad_net.eval()
 
     hist = ckpt.get("history")
     if hist is not None:
         hist = {"iters": np.asarray(hist["iters"]), "loss": np.asarray(hist["loss"])}
-    return grad_net, ckpt.get("meta", {}), hist 
+    return grad_net, ckpt.get("meta", {}), hist
 
 def train_or_load_gradnet(
     *,
@@ -289,6 +300,16 @@ def train_loop(
 
     from sampling import sample_conditions, adaptive_sample_conditions
 
+    if adaptive:
+        if cfg.batch_size is None:
+            raise ValueError("adaptive=True requires cfg.batch_size to be set")
+        _nominal_bs = int(cfg.batch_size)
+        _init_bs = max(1, int(np.ceil(_nominal_bs / 4.0)))
+        cfg.batch_size = _init_bs
+        _bs_max_local = int(4 * _init_bs)
+    else:
+        _bs_max_local = int(bs_max)
+
     def sample_X():
         if not adaptive:
             return sample_conditions(config, cfg.batch_size)  # (d,B)
@@ -350,7 +371,7 @@ def train_loop(
         heuristic = var / ((C**2) * (mu**2 + 1e-12))
 
         if adaptive and (heuristic > D0):
-            cfg.batch_size = min(int(cfg.batch_size * M), int(bs_max))
+            cfg.batch_size = min(int(cfg.batch_size * M), _bs_max_local)
 
         if (ep % cfg.log_every) == 0:
             print(
@@ -397,7 +418,7 @@ def loss_unified(
     supervision: bool,            # selects which term(s) are active
     lambda_hjb: float = 1e-6,
     lambda_dpc: float = 1e-3,
-    lambda_sup: float = 1e-6,
+    lambda_sup: float = 3e-3,
     horizon: int = 30,
     dt: float = 0.3,
 ):

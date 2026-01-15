@@ -99,6 +99,15 @@ def results_to_latex_table(
     return tab
 
 def evaluate_controller(config, controller, name, X_std, X_hard):
+    # --- allow swapped (controller, name) args ---
+    # common failure mode: controller is str, name is the controller object
+    if (not hasattr(controller, "eval_U")) and hasattr(name, "eval_U"):
+        controller, name = name, str(controller)
+
+    # (optional) nicer name default if someone passes non-string names
+    if not isinstance(name, str):
+        name = getattr(name, "__name__", name.__class__.__name__)
+
     results = []
     
     for dataset_name, X0_pool in [("Standard", X_std), ("Hard", X_hard)]:

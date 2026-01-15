@@ -1,15 +1,15 @@
-
+system = 'allen_cahn' # 'burgers', 'allen_cahn'
 
 # Problem dimensions
 n_states = 32
-n_controls = 3
+n_controls = 3 # burgers: 2, allen_cahn: 3
 
 # Time horizon parameters
 t1_initial = 30.0
 t1_scale = 6/5
 t1_max = 150.0
 
-system = 'allen_cahn'
+
 
 
 
