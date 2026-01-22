@@ -5,6 +5,7 @@ import numpy as np
 from scipy.integrate._ivp.ivp import METHODS, MESSAGES
 from scipy.integrate._ivp.ivp import OdeResult, OdeSolution, OdeSolver
 from scipy.integrate import solve_bvp
+import sampling
 
 
 def solve_ivp(
@@ -399,19 +400,35 @@ def sim_to_converge(
 
     # Solves over an extended time interval if needed to make ||f(x,u)|| -> 0
     while not converged and t[-1] < config.t1_max:
+        # Validate current state before simulation
+        X_current = X[:,-1].flatten()
+        if not np.isfinite(X_current).all():
+            # State became non-finite, simulation failed
+            break
+        
         t1 = np.maximum(config.t1_initial, t[-1] * config.t1_scale)
-        # Simulate the closed-loop system
-        t_new, X_new, status = sim_closed_loop(
-            dynamics,
-            jacobian,
-            controller,
-            [t[-1], t1],
-            X[:,-1],
-            events=events,
-            solver='LSODA',
-            atol=1e-06,
-            rtol=1e-03
-        )
+        
+        try:
+            # Simulate the closed-loop system
+            t_new, X_new, status = sim_closed_loop(
+                dynamics,
+                jacobian,
+                controller,
+                [t[-1], t1],
+                X_current,
+                events=events,
+                solver='LSODA',
+                atol=1e-06,
+                rtol=1e-03
+            )
+        except (ValueError, RuntimeError) as e:
+            # Simulation failed (likely non-finite state)
+            break
+
+        # Validate the new state
+        if not np.isfinite(X_new).all():
+            # Simulation produced non-finite values, stop
+            break
 
         t = np.concatenate((t, t_new[1:]))
         X = np.hstack((X, X_new[:,1:]))
@@ -419,8 +436,18 @@ def sim_to_converge(
         if status == 1:
             break
 
-        U = controller.eval_U(X[:,-1])
-        converged = np.linalg.norm(dynamics(X[:,-1], U)) < config.fp_tol
+        # Validate state before computing convergence
+        if not np.isfinite(X[:,-1]).all():
+            break
+            
+        try:
+            U = controller.eval_U(X[:,-1])
+            if not np.isfinite(U).all():
+                break
+            converged = np.linalg.norm(dynamics(X[:,-1], U)) < config.fp_tol
+        except (ValueError, RuntimeError):
+            # Failed to compute control or dynamics
+            break
 
     return t, X, converged
 
@@ -439,11 +466,14 @@ def monte_carlo(
     ----------
     OCP : instance of QRnet.problem_template.TemplateOCP
     config : instance of QRnet.problem_template.MakeConfig
-    controller : instantiated BaseNN subclass
+    controller : controller instance OR list of (name, controller) tuples
+        If list, evaluates all controllers with the same initial conditions
     X0_distance : float, optional
         Norm to use for random initial conditions
     random_seed : int, optional
         Seed for numpy random number generator
+    X0_pool : array, optional
+        Pre-computed initial conditions (n_states, n_MC)
     solve_open_loop : bool, default=False
         Set to True to solve the open loop OCP for each initial condition.
     suppress_warnings : bool, default=True
@@ -451,36 +481,51 @@ def monte_carlo(
 
     Returns
     -------
-    results_dict : dict containing
-        'seed' : random_seed
-        'X0_pool' : (n_states, n_MC) array
-            Initial conditions used for each Monte Carlo simulation.
-        'init_dists' : (n_MC,) array
-            Vector of initial condition norms
-        'final_dists': (n_MC,) array
-            Vector of norms of NN-controlled trajectories at final time
-        'NN_final_times' : (n_MC,) array
-            Vector of times for NN-controlled trajectories to reach equilibrium
-        'NN_costs' : (n_MC,) array
-            Vector of accumulated costs by NN-controlled trajectories
-        'opt_final_times' : (n_MC,) array
-            Vector of times for optimal trajectories to reach equilibrium
-        'opt_costs' : (n_MC,) array
-            Vector of optimal costs
-        'ocp_converged' : (n_MC,) bool array
-            Whether or not each OCP was solved correctly
+    If single controller: results_dict (as before)
+    If list of controllers: dict with keys as controller names, values as results_dict
     '''
 
-    n_MC = config.n_trajectories_MC
+    # Set default n_MC
+    n_MC = 100  # Default
 
+    # Check if controller is a list of (name, controller) tuples
+    if isinstance(controller, list):
+        # Generate X0_pool once for all controllers
+        if X0_pool is None:
+
+            np.random.seed(random_seed)
+            X0_pool = sampling.sample_conditions(config, n_MC)
+        
+        # Evaluate each controller with the same X0_pool
+        all_results = {}
+        for name, ctrl in controller:
+            if verbose:
+                print(f"\nEvaluating {name}...")
+            results = monte_carlo(
+                OCP, config, ctrl,
+                X0_distance=X0_distance, random_seed=None, X0_pool=X0_pool,
+                solve_open_loop=solve_open_loop, verbose=verbose, suppress_warnings=suppress_warnings
+            )
+            all_results[name] = results
+        
+        return all_results
+
+    # Original single controller code continues below...
+    # Set n_MC from X0_pool if provided, otherwise use default
     if X0_pool is None:
         np.random.seed(random_seed)
-        X0_pool = OCP.sample_X0(n_MC, dist=X0_distance)
+        X0_pool = sampling.sample_conditions(config, n_MC)
+        bad = ~np.isfinite(X0_pool)
+        bad_cols = np.where(bad.any(axis=0))[0]
+        bad_cols[:10], len(bad_cols)
+    else:
+        # If X0_pool is provided, use its actual size
+        n_MC = X0_pool.shape[1]  # X0_pool is (n_states, n_samples)
 
     ocp_converged = np.zeros(n_MC, dtype=bool)
-
     init_dists = np.empty(n_MC)
     final_dists = np.empty(n_MC)
+    # ... rest of the code
 
     NN_final_times = np.full_like(init_dists, np.inf)
     NN_costs = np.full_like(init_dists, np.inf)
@@ -491,7 +536,10 @@ def monte_carlo(
     opt_costs = np.full_like(NN_costs, -1.)
 
     def closed_converged(X, U):
-        return np.linalg.norm(OCP.dynamics(X, U), axis=0) < config.fp_tol
+        # Check both: dynamics are small AND state is near zero
+        dynamics_small = np.linalg.norm(OCP.dynamics(X, U), axis=0) < config.fp_tol
+        state_near_zero = OCP.norm(X) < 0.01  # Threshold for "near zero" - adjust as needed
+        return dynamics_small & state_near_zero
     def open_converged(X, U):
         return OCP.running_cost(X, U) < config.fp_tol
 
@@ -500,51 +548,148 @@ def monte_carlo(
     # ------------------------------------------------------------------------ #
 
     for i in tqdm(range(n_MC)):
-        X0 = X0_pool[:,i]
-
+        X0 = X0_pool[:,i].flatten()  # Ensure 1D array
+        
+        # Validate X0 before simulation
+        if not np.isfinite(X0).all():
+            # Invalid X0 - mark as failed but don't skip
+            init_dists[i] = np.nan
+            # final_dists, NN_final_times, NN_costs already set to inf/nan
+            continue
+        
         init_dists[i] = OCP.norm(X0)
-
+        
         # Integrates the closed-loop system
-        t, X, ode_converged = sim_to_converge(
-            OCP.dynamics, OCP.closed_loop_jacobian, controller, X0, config,
-            events=events
-        )
-        V, dVdX, U = controller.bvp_guess(X)
+        simulation_failed = False
+        try:
+            t, X, ode_converged = sim_to_converge(
+                OCP.dynamics, OCP.closed_loop_jacobian, controller, X0, config,
+                events=events
+            )
+            
+            # Check if simulation produced valid results
+            if not np.isfinite(X).all():
+                # Simulation produced non-finite values - difficult IC
+                simulation_failed = True
+                
+        except (ValueError, RuntimeError) as e:
+            # Simulation failed - difficult IC, not an error
+            simulation_failed = True
+        
+        if simulation_failed:
+            # Mark as not converged (values already inf/nan)
+            # This is just a difficult initial condition
+            continue
+        
+        # If we get here, simulation succeeded
+        try:
+            V, dVdX, U = controller.bvp_guess(X)
+        except Exception as e:
+            # bvp_guess failed - still count as simulation succeeded but can't use for OCP
+            V, dVdX, U = None, None, None
+        
+        # Check if controls are valid before proceeding
+        # Invalid controls indicate the controller failed, so don't count as converged
+        if U is None:
+            # Invalid controls - mark as not converged
+            # final_dists, NN_final_times, NN_costs already set to inf/nan
+            continue
+        
+        # Ensure U is a numpy array and check for invalid values
+        U = np.asarray(U)
+        if U.size == 0 or not np.isfinite(U).all():
+            # Invalid controls - mark as not converged
+            continue
+        
+        # Check if U has the right shape (should be (n_controls, n_timepoints) or (n_controls,))
+        # bvp_guess should return U with shape matching X: (n_controls, n_timepoints)
+        if U.ndim == 1:
+            # Reshape to (n_controls, 1) for consistency if it's a single control vector
+            if U.shape[0] == OCP.n_controls:
+                U = U.reshape(-1, 1)
+            else:
+                # Wrong number of controls - mark as not converged
+                continue
+        elif U.ndim == 2:
+            if U.shape[0] != OCP.n_controls:
+                # Wrong number of controls - mark as not converged
+                continue
+            # U.shape[1] should match X.shape[1] (number of time points), but we'll let
+            # clip_trajectory handle that - if shapes don't match, it will fail gracefully
+        else:
+            # Invalid dimensionality - mark as not converged
+            continue
+        
+        k, converged_flag = clip_trajectory(t, X, U, closed_converged)
+        
 
-        k, _ = clip_trajectory(t, X, U, closed_converged)
+        
+        # Only mark as converged if both ode_converged AND converged_flag are True
+        # This ensures the trajectory actually reached a valid equilibrium with valid controls
+        if ode_converged and converged_flag:
+            # Use the final state of the trajectory (X[:,-1]) which should be closest to equilibrium
+            # The trajectory continues after the first convergence point, so the final state is more accurate
+            if X.shape[1] > 0:
+                X_final = X[:,-1]  # Final state of the trajectory
+                final_dists_arr = OCP.norm(X_final)
+                # Extract scalar from array
+                final_dists[i] = float(final_dists_arr.flat[0] if final_dists_arr.size > 0 else 0.0)
+                
 
-        final_dists[i] = OCP.norm(X[:,k])
-        # If converged fill in results, otherwise leave as infinity
-        if ode_converged:
+            else:
+                final_dists[i] = np.inf
+            
             NN_final_times[i] = t[k]
-            NN_costs[i] = OCP.compute_cost(t, X, U).flatten()[-1]
+            try:
+                NN_costs[i] = OCP.compute_cost(t, X, U).flatten()[-1]
+                # Double-check that cost is valid
+                if not np.isfinite(NN_costs[i]):
+                    NN_final_times[i] = np.inf
+                    NN_costs[i] = np.inf
+            except Exception:
+                # Cost computation failed - mark as not converged
+                NN_final_times[i] = np.inf
+                NN_costs[i] = np.inf
+        else:
+            # Not converged - ensure final_dists is set to inf (not uninitialized garbage)
+            final_dists[i] = np.inf
+            # DEBUG
+            if i < 3:
+                print(f"Trajectory {i} NOT converged - final_dists[{i}] = inf")
 
         # -------------------------------------------------------------------- #
 
-        if solve_open_loop:
-            ocp_sol, cont_ocp_sol, ocp_converged[i] = solve_ocp(
-                OCP, config,
-                t_guess=t, X_guess=X, U_guess=U, dVdX_guess=dVdX, V_guess=V,
-                solve_to_converge=True,
-                verbose=verbose, suppress_warnings=suppress_warnings
-            )
+        if solve_open_loop and V is not None:
+            try:
+                ocp_sol, cont_ocp_sol, ocp_converged[i] = solve_ocp(
+                    OCP, config,
+                    t_guess=t, X_guess=X, U_guess=U, dVdX_guess=dVdX, V_guess=V,
+                    solve_to_converge=True,
+                    verbose=verbose, suppress_warnings=suppress_warnings
+                )
 
-            t = np.concatenate((ocp_sol['t'].flatten(), t.flatten()))
-            t = np.unique(t)
-            ocp_sol = cont_ocp_sol(t)
 
-            k, _ = clip_trajectory(
-                t, ocp_sol['X'], ocp_sol['U'], open_converged
-            )
+                t = np.concatenate((ocp_sol['t'].flatten(), t.flatten()))
+                t = np.unique(t)
+                ocp_sol = cont_ocp_sol(t)
 
-            opt_costs[i] = ocp_sol['V'].flatten()[0]
-            opt_final_times[i] = t[k]
+                k, _ = clip_trajectory(
+                    t, ocp_sol['X'], ocp_sol['U'], open_converged
+                )
 
-    # ------------------------------------------------------------------------ #
+                opt_costs[i] = ocp_sol['V'].flatten()[0]
+                opt_final_times[i] = t[k]
+
+                            # ... rest of open loop code
+            except Exception:
+                # OCP solve failed - mark as not converged
+                ocp_converged[i] = False
+
+
 
     results_dict = {
         'seed': random_seed,
-        'X0_pool': X0_pool,
+        #'X0_pool': X0_pool,
         'init_dists': init_dists,
         'final_dists': final_dists,
         'NN_final_times': NN_final_times,

@@ -1,301 +1,279 @@
-def make_config_spec(config, *, keys=None, title="Configuration"):
-    if keys is None:
-        keys = ["system", "seed", "n_states", "n_controls", "t1_initial", "t1_scale", "t1_max", "fp_tol"]
-        keys = [k for k in keys if hasattr(config, k)]
-    vals = [getattr(config, k) for k in keys]
-    return table_kv(title=title, keys=keys, values=vals)
+import os
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from IPython.display import display, Markdown
 
+def _get_savepath(savepath, config):
+    if config and hasattr(config, "system") and "tables" in savepath:
+        p = Path(savepath)
+        if config.system not in p.parts:
+            parts = list(p.parts)
+            try:
+                idx = parts.index("tables")
+                parts.insert(idx + 1, str(config.system))
+                return str(Path(*parts))
+            except ValueError: pass
+    return savepath
 
-def make_traincfg_spec(train_cfg, *, keys=None, title="Training configuration"):
-    if keys is None:
-        keys = ["sup_epochs", "sup_lr", "unsup_epochs", "unsup_lr", "batch_size", "log_every", "grad_clip", "device"]
-        keys = [k for k in keys if hasattr(train_cfg, k)]
-    vals = [getattr(train_cfg, k) for k in keys]
-    return table_kv(title=title, keys=keys, values=vals)
-
-
-def make_data_summary_spec(config, data, *, title="Dataset summary"):
-    import numpy as np
-    t_all = np.asarray(data["t"]).reshape(-1)
-    X_all = np.asarray(data["X"])
-    X_norms = config.norm(X_all).reshape(-1)
-
-    keys = ["n_trajectories", "n_points", "t_min", "t_max", "|X| mean", "|X| max", "||X|| mean", "||X|| max"]
-    vals = [
-        int(data.get("n_trajectories", -1)),
-        int(X_all.shape[1]),
-        f"{float(t_all.min()):.2f}",
-        f"{float(t_all.max()):.2f}",
-        f"{float(np.mean(np.abs(X_all))):.2f}",
-        f"{float(np.max(np.abs(X_all))):.2f}",
-        f"{float(np.mean(X_norms)):.2f}",
-        f"{float(np.max(X_norms)):.2f}",
-    ]
-    return table_kv(title=title, keys=keys, values=vals)
-
-def save_keyval_table_tex_2row(
-    *,
-    keys,
-    values,
-    savepath,
-    title: str | None = None,   # optional bold title line above tabular
-):
-    import os
-
-    def esc(s: str) -> str:
-        return (s.replace("\\", "\\textbackslash{}")
-                 .replace("&", "\\&")
-                 .replace("%", "\\%")
-                 .replace("$", "\\$")
-                 .replace("#", "\\#")
-                 .replace("_", "\\_")
-                 .replace("{", "\\{")
-                 .replace("}", "\\}")
-                 .replace("~", "\\textasciitilde{}")
-                 .replace("^", "\\textasciicircum{}"))
-
-    keys = [esc(str(k)) for k in keys]
-    vals = [esc(str(v)) for v in values]
-
-    n = len(keys)
-    if len(vals) != n:
-        raise ValueError("keys and values must have same length")
-
+def save_dataframe_latex(df, savepath, caption=None, label=None, precision=4):
     os.makedirs(os.path.dirname(savepath) or ".", exist_ok=True)
+    disp_df = df.copy()
+    
+    def fmt(x):
+        if isinstance(x, (float, np.floating)):
+            return f"{x:.2e}" if (abs(x) < 1e-4 or abs(x) > 1e4) else f"{x:.{precision}g}"
+        return str(x)
 
-    cols = "@{}" + ("c" * n) + "@{}"
-    header = " & ".join([f"\\textbf{{{k}}}" for k in keys]) + " \\\\"
-    row    = " & ".join(vals) + " \\\\"
+    def escape_tex(s):
+        return str(s).replace("_", "\\_").replace("%", "\\%").replace("&", "\\&")
+        
+    for col in disp_df.columns:
+        disp_df[col] = disp_df[col].map(fmt).map(escape_tex)
+    disp_df.columns = disp_df.columns.map(escape_tex)
 
-    out = []
-    if title:
-        out.append(f"\\noindent\\textbf{{{esc(title)}}}\\\\")
-    out += [
-        "\\begingroup",
-        "\\setlength{\\tabcolsep}{3.5pt} % tighter columns",
-        "\\renewcommand{\\arraystretch}{1.15}",
-        f"\\begin{{tabular}}{{{cols}}}",
-        "\\toprule",
-        header,
-        "\\midrule",
-        row,
-        "\\bottomrule",
-        "\\end{tabular}",
-        "\\endgroup",
-        "",
-    ]
+    # Use Styler for Pandas 2.0+
+    styler = disp_df.style.hide(axis="index")
+    latex_str = styler.to_latex(
+        column_format="l" + "r" * (len(df.columns) - 1),
+        hrules=True, label=label, caption=caption,
+        position="H", position_float="centering"
+    )
 
     with open(savepath, "w", encoding="utf-8") as f:
-        f.write("\n".join(out))
+        f.write(latex_str)
 
-def table_kv(*, title=None, keys, values, precision=6):
-    import numpy as np
-    def fmt(v):
-        if v is None:
-            return ""
-        if isinstance(v, (float, np.floating)):
-            return f"{float(v):.{int(precision)}g}"
-        return str(v)
-    return {"title": title, "keys": list(keys), "values": [fmt(v) for v in values]}
+# --- Notebook Display Helper ---
 
+def show_spec(obj, keys, title=None):
+    """
+    Cleaner replacement for show_katex_array.
+    Creates a spec on the fly and displays it as a styled HTML table.
+    """
+    valid_keys = [k for k in keys if hasattr(obj, k)]
+    vals = [getattr(obj, k) for k in valid_keys]
+    
+    df = pd.DataFrame([vals], columns=valid_keys)
+    if title:
+        display(Markdown(f"**{title}**"))
+    
+    # Stylish Jupyter display
+    display(df.style.hide(axis="index").set_table_styles([
+        {'selector': 'th', 'props': [('background-color', '#f4f4f4'), ('color', 'black'), ('font-weight', 'bold')]}
+    ]))
 
-def show_kv_table(spec, *, mode="1row"):
+# --- Specific Thesis Helpers ---
+
+def save_config_table(config, savepath="thesis/tables/config.tex"):
+    keys = ["system", "seed", "n_states", "n_controls", "t1_initial", "fp_tol"]
+    data = {"Parameter": [k for k in keys if hasattr(config, k)],
+            "Value": [getattr(config, k) for k in keys if hasattr(config, k)]}
+    save_dataframe_latex(pd.DataFrame(data), _get_savepath(savepath, config), 
+                         caption="Problem configuration.", label="tab:config")
+
+def save_results_table(results_list, config=None, savepath="thesis/tables/results.tex"):
+    """
+    Reformats the flat results list into a professional Thesis table.
+    Groups by Controller and stacks Standard/Hard datasets as rows.
+    """
     import pandas as pd
-    from IPython.display import display, Markdown
+    df = pd.DataFrame(results_list)
+    
+    # 1. Clean up the naming for the Thesis
+    # Use LaTeX math mode for headers (e.g., $t_{conv}$)
+    rename_map = {
+        "Controller": "Method",
+        "Dataset": "Data",
+        "Stability (S)": "$S$",
+        "t_conv (med)": "$t_{\text{conv}}$",
+        "Avg Cost (J)": "$J_{\text{avg}}$"
+    }
+    df = df.rename(columns=rename_map)
 
-    if spec.get("title"):
-        display(Markdown(f"**{spec['title']}**"))
+    # 2. Reorder columns to put Method and Data first
+    cols = ["Method", "Data", "$S$", "$t_{\text{conv}}$", "$J_{\text{avg}}$"]
+    df = df[[c for c in cols if c in df.columns]]
 
-    keys, values = spec["keys"], spec["values"]
-    if mode == "2col":
-        df = pd.DataFrame({"Parameter": keys, "Value": values})
-    else:  # "1row"
-        df = pd.DataFrame([values], columns=keys)
+    # 3. Format 'S' as a proper percentage if it's a float
+    if "$S$" in df.columns:
+        df["$S$"] = df["$S$"].apply(lambda x: f"{x:.0%}" if isinstance(x, (float, int)) else x)
 
-    display(df.style.hide(axis="index"))
+    # 4. Save using our fixed LaTeX function
+    full_path = _get_savepath(savepath, config)
+    save_dataframe_latex(
+        df, 
+        full_path, 
+        caption="Performance comparison of learned controllers vs. LQR baseline.", 
+        label="tab:results"
+    )
+
+def save_data_summary_table(config, data, savepath="thesis/tables/data_summary.tex"):
+    """
+    Extracts statistics from the data dictionary and saves a summary table.
+    """
+    import numpy as np
+    
+    X_all = np.asarray(data["X"])
+    t_all = np.asarray(data["t"]).reshape(-1)
+    X_norms = config.norm(X_all).reshape(-1)
+
+    stats = {
+        "Metric": ["Trajectories", "Total Points", "t min/max", "|X| mean/max", "||X|| mean/max"],
+        "Value": [
+            int(data.get("n_trajectories", -1)),
+            int(X_all.shape[1]),
+            f"{t_all.min():.2f} / {t_all.max():.2f}",
+            f"{np.mean(np.abs(X_all)):.2f} / {np.max(np.abs(X_all)):.2f}",
+            f"{np.mean(X_norms):.2f} / {np.max(X_norms):.2f}"
+        ]
+    }
+    df_stats = pd.DataFrame(stats)
+    save_dataframe_latex(df_stats, _get_savepath(savepath, config), 
+                         caption="Dataset numerical summary.", label="tab:data_summary")
+
+    return df_stats
+
+def save_params_table(obj, savepath, title="Configuration", keys=None, config=None):
+    """
+    Generic function to save any object's attributes to a LaTeX table.
+    """
+    # If no keys provided, try to get all non-private attributes
+    if keys is None:
+        keys = [k for k in obj.__dict__.keys() if not k.startswith('_')]
+    
+    data = {
+        "Parameter": [str(k) for k in keys if hasattr(obj, k)],
+        "Value": [getattr(obj, k) for k in keys if hasattr(obj, k)]
+    }
+    df = pd.DataFrame(data)
+    
+    # Use the system-specific path if config is provided
+    full_path = _get_savepath(savepath, config)
+    
+    save_dataframe_latex(df, full_path, caption=title, label=f"tab:{Path(savepath).stem}")
+
+
+def show_monte_carlo_results(results_dict, controller_name="Controller", title=None):
+    """
+    Display Monte Carlo evaluation results in a nice formatted table.
+    
+    Parameters
+    ----------
+    results_dict : dict or dict of dicts
+        Output from simulation.monte_carlo() - can be single controller or multiple
+    controller_name : str, optional
+        Name if single controller (ignored if results_dict contains multiple)
+    title : str, optional
+        Title for the table
+    """
+    import numpy as np
+    
+    # Check if this is a dict of results (multiple controllers)
+    if isinstance(results_dict, dict) and 'X0_pool' not in results_dict:
+        # Multiple controllers - create comparison table
+        rows = []
+        for name, res in results_dict.items():
+            rows.append(_compute_monte_carlo_stats(res, name))
+        
+        df = pd.DataFrame(rows)
+    else:
+        # Single controller
+        df = _compute_monte_carlo_stats(results_dict, controller_name)
+        df = pd.DataFrame([df])
+    
+    if title:
+        display(Markdown(f"**{title}**"))
+    
+    display(df.style.hide(axis="index").set_table_styles([
+        {'selector': 'th', 'props': [('background-color', '#f4f4f4'), ('color', 'black'), ('font-weight', 'bold')]}
+    ]))
+    
     return df
 
-def save_traincfg_table_tex(
-    *,
-    train_cfg,
-    savepath="thesis/tables/traincfg.tex",
-    keys=None,
-    title: str | None = "Training configuration",
-):
-    if keys is None:
-        keys = ["sup_epochs", "sup_lr", "unsup_epochs", "unsup_lr", "batch_size", "log_every", "grad_clip", "device"]
-        keys = [k for k in keys if hasattr(train_cfg, k)]
-    vals = []
-    for k in keys:
-        v = getattr(train_cfg, k)
-        vals.append("" if v is None else (f"{v:.6g}" if isinstance(v, float) else v))
-    save_keyval_table_tex_2row(keys=keys, values=vals, savepath=savepath, title=title)
-
-
-def save_config_table_tex(
-    *,
-    config,
-    savepath="thesis/tables/config.tex",
-    keys=None,
-    title: str | None = "Configuration",
-):
-    if keys is None:
-        keys = ["system", "seed", "n_states", "n_controls", "t1_initial", "t1_scale", "t1_max", "fp_tol"]
-        keys = [k for k in keys if hasattr(config, k)]
-    vals = []
-    for k in keys:
-        v = getattr(config, k)
-        vals.append(f"{v:.6g}" if isinstance(v, float) else v)
-    save_keyval_table_tex_2row(keys=keys, values=vals, savepath=savepath, title=title)
-
-def save_data_summary_table_tex(
-    *,
-    config,
-    data,
-    savepath="thesis/tables/data_summary.tex",
-    title: str | None = "Dataset summary",
-):
+def _compute_monte_carlo_stats(results_dict, controller_name):
+    """Helper to compute stats for a single controller."""
     import numpy as np
+    
+    init_dists = np.asarray(results_dict['init_dists'])
+    final_dists = np.asarray(results_dict['final_dists'])
+    NN_final_times = np.asarray(results_dict['NN_final_times'])
+    NN_costs = np.asarray(results_dict['NN_costs'])
+    
+    converged_mask = np.isfinite(NN_final_times)
+    n_converged = np.sum(converged_mask)
+    n_total = len(NN_final_times)
+    stability = n_converged / n_total if n_total > 0 else 0.0
+    
+    return {
+        "Controller": controller_name,
+        "Stability (S)": f"{stability:.1%}",
+      #  "Converged / Total": f"{n_converged} / {n_total}",
+      #  "Initial ||X|| (mean)": f"{np.mean(init_dists):.4f}",
+        "Final ||X|| (mean)": f"{np.mean(final_dists[converged_mask]):.4f}" if n_converged > 0 else "N/A",
+        "t_conv (median)": f"{np.median(NN_final_times[converged_mask]):.2f}" if n_converged > 0 else "N/A",
+        "t_conv (mean)": f"{np.mean(NN_final_times[converged_mask]):.2f}" if n_converged > 0 else "N/A",
+        "Cost J (median)": f"{np.median(NN_costs[converged_mask]):.4f}" if n_converged > 0 else "N/A",
+        "Cost J (mean)": f"{np.mean(NN_costs[converged_mask]):.4f}" if n_converged > 0 else "N/A"
+    }
 
-    t_all = np.asarray(data["t"]).reshape(-1)
-    X_all = np.asarray(data["X"])  # (d,N)
 
-    n_traj = int(data.get("n_trajectories", -1))
-    n_points = int(X_all.shape[1])
+def save_monte_carlo_results(results_dict, controller_name="Controller", config=None, 
+                            savepath="thesis/tables/monte_carlo.tex"):
+    """
+    Save Monte Carlo evaluation results to a LaTeX table file.
+    
+    Parameters
+    ----------
+    results_dict : dict
+        Output from simulation.monte_carlo()
+    controller_name : str
+        Name of the controller being evaluated
+    config : config object, optional
+        Used for system-specific path handling
+    savepath : str
+        Path to save the LaTeX table
+    """
+    import numpy as np
+    
+    if isinstance(results_dict, dict) and 'X0_pool' not in results_dict:
+        # Multiple controllers - create comparison table
+        rows = []
+        for name, res in results_dict.items():
+            rows.append(_compute_monte_carlo_stats_latex(res, name))
+        df = pd.DataFrame(rows)
+        caption = "Monte Carlo evaluation results comparing multiple controllers."
+    else:
+        # Single controller
+        stats = _compute_monte_carlo_stats_latex(results_dict, controller_name)
+        df = pd.DataFrame([stats])
+        caption = f"Monte Carlo evaluation results for {controller_name}."
+    
+    full_path = _get_savepath(savepath, config)
+    save_dataframe_latex(df, full_path, caption=caption, label="tab:monte_carlo")
+    return df
 
-    X_abs_mean = float(np.mean(np.abs(X_all)))
-    X_abs_max  = float(np.max(np.abs(X_all)))
-
-    X_norms = config.norm(X_all).reshape(-1)
-    Xn_mean = float(np.mean(X_norms))
-    Xn_max  = float(np.max(X_norms))
-
-    keys = ["n_trajectories", "n_points", "t_min", "t_max", "|X| mean", "|X| max", "||X|| mean", "||X|| max"]
-    vals = [
-        n_traj,
-        n_points,
-        f"{float(t_all.min()):.2f}",
-        f"{float(t_all.max()):.2f}",
-        f"{X_abs_mean:.2f}",
-        f"{X_abs_max:.2f}",
-        f"{Xn_mean:.2f}",
-        f"{Xn_max:.2f}",
-    ]
-
-    save_keyval_table_tex_2row(keys=keys, values=vals, savepath=savepath, title=title)
-
-def show_katex_array(spec, *, bold_keys=True, caption=None, rules=True):
-    from IPython.display import display, Latex, Markdown
-
-    def esc(s: str) -> str:
-        return (s.replace("\\", "\\\\")
-                 .replace("&", "\\&")
-                 .replace("%", "\\%")
-                 .replace("$", "\\$")
-                 .replace("#", "\\#")
-                 .replace("_", "\\_")
-                 .replace("{", "\\{")
-                 .replace("}", "\\}")
-                 .replace("~", "\\sim ")
-                 .replace("^", "\\hat{}"))
-
-    keys = [esc(str(k)) for k in spec["keys"]]
-    vals = [esc(str(v)) for v in spec["values"]]
-    n = len(keys)
-
-    key_row = " & ".join([rf"\mathbf{{{k}}}" for k in keys]) if bold_keys else " & ".join(keys)
-    val_row = " & ".join([rf"\text{{{v}}}" for v in vals])
-
-    h = r"\hline" if rules else ""
-    colspec = "c" * n
-    latex = rf"\begin{{array}}{{{colspec}}}{h} {key_row} \\ {h} {val_row} \\ {h}\end{{array}}"
-    display(Latex(latex))
-
-    if caption:
-        display(Markdown(f"<div style='text-align:center; font-size:0.9em;'><b>Table.</b> {caption}</div>"))
-
-def save_results_table_tex(
-    results,
-    *,
-    savepath="thesis/tables/controllers.tex",
-    title: str | None = "Controller results",
-    datasets=("Standard", "Hard"),
-):
-    import os
-    from collections import defaultdict
-
-    # group rows by controller then dataset
-    by_ctrl = defaultdict(dict)
-    for r in results:
-        c = str(r.get("Controller", ""))
-        d = str(r.get("Dataset", ""))
-        by_ctrl[c][d] = r
-
-    os.makedirs(os.path.dirname(savepath) or ".", exist_ok=True)
-
-    # common header keys (config style)
-    keys = ["Dataset", "S", "tconv", "J"]
-    blocks = []
-    if title:
-        blocks.append(f"\\noindent\\textbf{{{title}}}\\\\\n")
-
-    for ctrl, rows in by_ctrl.items():
-        # build one 2-row table per controller (same style as config)
-        vals = []
-        for ds in datasets:
-            r = rows.get(ds, {})
-            vals.append(str(ds))
-            vals.append(str(r.get("Stability (S)", "")))
-            vals.append(str(r.get("t_conv (med)", "")))
-            vals.append(str(r.get("Avg Cost (J)", "")))
-
-        # but keys need to match values -> repeat per dataset
-        kk = []
-        for ds in datasets:
-            tag = "std" if ds.lower().startswith("std") else "hard"
-            kk += [f"Dataset_{tag}", f"S_{tag}", f"tconv_{tag}", f"J_{tag}"]
-
-        # reuse your existing 2-row writer into a string by writing to a temp path
-        # simplest: directly call save_keyval_table_tex_2row with a per-controller path
-        blocks.append(f"\\noindent\\textbf{{{ctrl}}}\\\\\n")
-        tmp_path = savepath.replace(".tex", f"_{ctrl}.tex")
-        save_keyval_table_tex_2row(keys=kk, values=vals, savepath=tmp_path, title=None)
-        blocks.append(f"\\input{{{tmp_path[:-4]}}}\n\\vspace{{0.6em}}\n")
-
-    with open(savepath, "w", encoding="utf-8") as f:
-        f.write("".join(blocks))
-
-def make_results_spec_2row(
-    results,
-    *,
-    title="Results",
-    datasets=("Standard", "Hard"),
-    controller=None,   # if None and multiple controllers exist -> first one
-):
-    # group by controller then dataset
-    from collections import defaultdict
-    by_ctrl = defaultdict(dict)
-    for r in results:
-        c = str(r.get("Controller", ""))
-        d = str(r.get("Dataset", ""))
-        by_ctrl[c][d] = r
-
-    if not by_ctrl:
-        return table_kv(title=title, keys=["(no results)"], values=[""])
-
-    ctrl = controller or sorted(by_ctrl.keys())[0]
-    rows = by_ctrl[ctrl]
-
-    keys = []
-    vals = []
-    for ds in datasets:
-        tag = "std" if ds.lower().startswith("std") else "hard"
-        r = rows.get(ds, {})
-        keys += [f"S_{tag}", f"tconv_{tag}", f"J_{tag}"]
-        vals += [
-            r.get("Stability (S)", ""),
-            r.get("t_conv (med)", ""),
-            r.get("Avg Cost (J)", ""),
-        ]
-
-    return table_kv(title=f"{title}: {ctrl}", keys=keys, values=vals)
+def _compute_monte_carlo_stats_latex(results_dict, controller_name):
+    """Helper for LaTeX formatting."""
+    import numpy as np
+    
+    init_dists = np.asarray(results_dict['init_dists'])
+    final_dists = np.asarray(results_dict['final_dists'])
+    NN_final_times = np.asarray(results_dict['NN_final_times'])
+    NN_costs = np.asarray(results_dict['NN_costs'])
+    
+    converged_mask = np.isfinite(NN_final_times)
+    n_converged = np.sum(converged_mask)
+    n_total = len(NN_final_times)
+    stability = n_converged / n_total if n_total > 0 else 0.0
+    
+    return {
+        "Controller": controller_name,
+        "Stability ($S$)": f"{stability:.1%}",
+     #   "Converged / Total": f"{n_converged} / {n_total}",
+     #   "Initial $\\|X\\|$ (mean)": f"{np.mean(init_dists):.4f}",
+        "Final $\\|X\\|$ (mean)": f"{np.mean(final_dists[converged_mask]):.4f}" if n_converged > 0 else "N/A",
+        "$t_{\\text{conv}}$ (median)": f"{np.median(NN_final_times[converged_mask]):.2f}" if n_converged > 0 else "N/A",
+        "$t_{\\text{conv}}$ (mean)": f"{np.mean(NN_final_times[converged_mask]):.2f}" if n_converged > 0 else "N/A",
+        "Cost $J$ (median)": f"{np.median(NN_costs[converged_mask]):.4f}" if n_converged > 0 else "N/A",
+        "Cost $J$ (mean)": f"{np.mean(NN_costs[converged_mask]):.4f}" if n_converged > 0 else "N/A"
+    }

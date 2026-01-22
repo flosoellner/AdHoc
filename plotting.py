@@ -15,6 +15,45 @@ from simulation import sim_closed_loop
 # Styling helpers
 # ---------------------------------------------------------------------
 
+def _infer_system(config=None) -> str | None:
+    if config is not None and hasattr(config, "system"):
+        s = getattr(config, "system")
+        return None if s is None else str(s)
+    # fallback: use the repo's config.py default
+    try:
+        import config as _cfg  # type: ignore
+        s = getattr(_cfg, "system", None)
+        return None if s is None else str(s)
+    except Exception:
+        return None
+
+
+def _with_system_figures_subdir(savepath, config=None):
+    """
+    If savepath is under figures/, automatically write into figures/<system>/...
+
+    Examples:
+      figures/foo.pdf -> figures/allen_cahn/foo.pdf
+      figures/allen_cahn/foo.pdf -> unchanged
+    """
+    if savepath is None:
+        return None
+    p = Path(savepath)
+    if p.is_absolute():
+        return p
+
+    system = _infer_system(config)
+    if not system:
+        return p
+
+    parts = p.parts
+    if len(parts) >= 1 and parts[0] == "figures":
+        if len(parts) >= 2 and parts[1] == system:
+            return p
+        return Path("figures") / system / Path(*parts[1:])
+    return p
+
+
 def _iter_named_controllers(controllers):
     """
     Normalize a controllers collection into an iterator of (name, controller).
@@ -134,10 +173,16 @@ def plot_value_slice(
     controllers,                 # list like [("LQR", config.ocp.LQR), ("ctrl1", ctrl1)]
     i=None,                      # basis slice x = s e_i
     v=None,                      # direction slice x = s v (overrides i)
-    smax=12.0,
-    ns=401,
+    smax=2.0,
+    ns=101,
     n_quad=64,
     device="cpu",
+    # bundle-of-slices visualization (optional)
+    n_slices: int = 50,
+    slice_sigma: float = 0.0,    # std-dev of additive offset in state units
+    slice_seed: int = 0,
+    band_alpha: float = 0.08,    # alpha for individual slices (when n_slices>1)
+    show_mean: bool = True,      # overlay mean curve (when n_slices>1)
     title=None,
     figsize=(6.2, 3.2),
     savepath=None,
@@ -156,7 +201,7 @@ def plot_value_slice(
         if v.size != d:
             raise ValueError(f"v must have shape ({d},)")
         v = v / (np.linalg.norm(v) + 1e-12)
-        X = v[:, None] * s[None, :]          # (d,ns)
+        X0 = v[:, None] * s[None, :]          # (d,ns)
         xlabel = r"$s$ in $x=s\,v$"
     else:
         if i is None:
@@ -164,14 +209,52 @@ def plot_value_slice(
         i = int(i)
         if not (0 <= i < d):
             raise ValueError(f"i must be in [0,{d-1}]")
-        X = np.zeros((d, s.size))
-        X[i, :] = s
+        X0 = np.zeros((d, s.size))
+        X0[i, :] = s
         xlabel = rf"$x_{{{i}}}$ (slice; other components $0$)"
 
     fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
     for k, (name, ctrl) in enumerate(_iter_named_controllers(controllers)):
-        V = _value_from_controller_or_gradnet(ctrl, X, device=device, n_quad=n_quad)
-        ax.plot(s, V, label=str(name))
+        # Create a "bundle" of nearby slices x(s) = x0(s) + offset to form a thick curve.
+        nslices = int(max(1, n_slices))
+        sigma = float(slice_sigma)
+
+        if (nslices <= 1) or (sigma <= 0.0):
+            V = _value_from_controller_or_gradnet(ctrl, X0, device=device, n_quad=n_quad)
+            ax.plot(s, V, label=str(name))
+            continue
+
+        rng = np.random.default_rng(int(slice_seed) + int(k))
+        Vs = []
+
+        # Put a single "center" slice into the bundle
+        V_center = _value_from_controller_or_gradnet(ctrl, X0, device=device, n_quad=n_quad)
+        Vs.append(np.asarray(V_center).reshape(-1))
+
+        # Draw additional offset slices with low alpha.
+        for _j in range(nslices - 1):
+            off = rng.normal(size=d)
+
+            if v is not None:
+                # project offset orthogonal to v so we keep the same direction slice
+                off = off - v * float(np.dot(v, off))
+            else:
+                # keep the coordinate slice direction: don't perturb along e_i
+                off[i] = 0.0
+
+            off = sigma * off
+            X = X0 + off[:, None]
+            Vj = _value_from_controller_or_gradnet(ctrl, X, device=device, n_quad=n_quad)
+            Vj = np.asarray(Vj).reshape(-1)
+            Vs.append(Vj)
+            ax.plot(s, Vj, alpha=float(band_alpha), lw=2.0)
+
+        if show_mean:
+            Vmean = np.mean(np.stack(Vs, axis=0), axis=0)
+            ax.plot(s, Vmean, lw=2.6, label=str(name))
+        else:
+            # Label only once (on the center curve) to avoid legend spam.
+            ax.plot(s, Vs[0], lw=2.6, label=str(name))
 
 
 
@@ -182,7 +265,7 @@ def plot_value_slice(
     ax.grid(True, alpha=0.3)
     ax.legend()
 
-    _save_fig(fig, savepath)
+    _save_fig(fig, _with_system_figures_subdir(savepath, config))
     return fig
 
 
@@ -190,7 +273,7 @@ def plot_value_vs_state_norm(
     *,
     config,
     controllers,                 # list like [("LQR", config.ocp.LQR), ("ctrl1", ctrl1)]
-    n=8000,
+    n=1000,
     seed=0,
     dist=None,
     n_quad=32,
@@ -216,6 +299,10 @@ def plot_value_vs_state_norm(
         # in plot_value_vs_state_norm:
         ax.scatter(xnorm, V, s=float(s), alpha=float(alpha), label=str(name))
 
+    # hide negative values by cutting y-axis at 0
+    _ymin, _ymax = ax.get_ylim()
+    ax.set_ylim(0.0, max(0.0, float(_ymax)))
+
     ax.set_xlabel(r"$\|x\|_w$")
     ax.set_ylabel(r"$V(x)$")
     if title:
@@ -223,7 +310,7 @@ def plot_value_vs_state_norm(
     ax.grid(True, alpha=0.3)
     ax.legend()
 
-    _save_fig(fig, savepath)
+    _save_fig(fig, _with_system_figures_subdir(savepath, config))
     return fig
 
 class _ZeroController:
@@ -241,7 +328,7 @@ def plot_3d(
     *,
     config,
     controller,
-    tspan=(0.0, 30.0),
+    tspan=(0.0, 20.0),
     Nt=250,
     seed=0,
     dist=None,
@@ -337,7 +424,7 @@ def plot_3d(
         # optional: also reduce tick marks themselves
         ax.tick_params(length=0)
 
-    _save_fig(fig, savepath)
+    _save_fig(fig, _with_system_figures_subdir(savepath, config))
 
     return fig
 
@@ -362,170 +449,127 @@ def _eval_grad(controller, X: np.ndarray) -> np.ndarray:
 
 
 
-def plot_hjb_residual_shock_line(
+
+
+def plot_value_analysis_combined(
     *,
     config,
-    controllers,                 # [("LQR", config.ocp.LQR), ("ctrl1", ctrl1.grad_net)]
-    shock=None,                  # (d,) numpy; if None, sample one and scale it
-    shock_seed: int = 0,
-    s_grid=None,                 # array of intensities; default below
-    dist_for_shock: float = 1.0, # used only if shock=None
-    device: str = "cpu",
-    metric: str = "abs",         # "abs" -> |H|, "sq" -> H^2
-    log10: bool = False,
-    eps: float = 1e-12,
-    colors=None,
-    title: str | None = None,
-    figsize=(6.2, 3.2),
-    savepath=None,
-):
-    """
-    1D "truth plot": shock intensity s vs HJB residual error at x = s * shock.
-
-    Notes:
-      - This calls `controls.train.loss_unified(...)` with mode="unsupervised", supervision=False.
-      - That returns (total, hjb_err, dpc_err, sup_err); we plot hjb_err which equals H(x)^2.
-    """
-    from controls.train import loss_unified
-
-    if s_grid is None:
-        s_grid = np.linspace(0.0, 4.0, 20)
-    s_grid = np.asarray(s_grid, dtype=float).reshape(-1)
-
-    d = int(config.n_states)
-
-    # fixed shock shape
-    if shock is None:
-        Xs = sample_conditions(config, n=1, seed=int(shock_seed), dist=float(dist_for_shock))  # (d,1)
-        shock = Xs[:, 0]
-    shock = np.asarray(shock, dtype=float).reshape(-1)
-    if shock.size != d:
-        raise ValueError(f"shock must have shape ({d},)")
-
-    class _LQRAsGradModel:
-        """Shim so train.py loss can call model(X)->dVdX and access model.config."""
-        def __init__(self, config):
-            self.config = config
-
-        def __call__(self, X):  # X: (B,d) torch
-            G = self.config.ocp.LQR.eval_dVdX(X.detach().cpu().numpy().T)  # (d,B) numpy
-            return torch.tensor(G.T, dtype=X.dtype, device=X.device)       # (B,d)
-
-    def _as_grad_model(obj):
-        # If it's an LQR controller, wrap as model.
-        if hasattr(obj, "eval_dVdX"):
-            return _LQRAsGradModel(config)
-
-        # If it's a policy wrapper (Control), unwrap to its grad_net if present.
-        if hasattr(obj, "grad_net") and (obj.grad_net is not None):
-            obj = obj.grad_net
-
-        # assume it's a torch model like GradNet with .config
-        if not hasattr(obj, "config"):
-            raise ValueError(
-                "For non-LQR, pass the GradNet itself (e.g. ctrl.grad_net or model), "
-                "not a string or a controller without gradient information."
-            )
-        return obj
-
-    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
-
-    for k, (name, obj) in enumerate(_iter_named_controllers(controllers)):
-        model = _as_grad_model(obj)
-        ys = []
-        for s in s_grid:
-            Xnp = shock[:, None] * float(s)                               # (d,1)
-            Xt = torch.tensor(Xnp.T, dtype=torch.float32, device=device)  # (1,d)
-
-            total, hjb_err, dpc_err, sup_err = loss_unified(
-                model,
-                (Xt,),
-                mode="unsupervised",
-                supervision=False,
-            )
-
-            # for the "truth line" you want H(x)^2, which is hjb_err
-            hjb_sq = hjb_err
-            val = float(hjb_sq.detach().cpu().numpy())
-
-            if metric == "abs":
-                val = np.sqrt(val + float(eps))
-            elif metric == "sq":
-                pass
-            else:
-                raise ValueError("metric must be 'abs' or 'sq'")
-
-            if log10:
-                val = np.log10(val + float(eps))
-
-            ys.append(val)
-
-        ax.plot(s_grid, ys, label=str(name))
-
-    ax.set_xlabel(r"shock intensity $s$ (state $x = s\,x_{\mathrm{shock}}$)")
-    ylab = (r"$\log_{10}(|H|)$" if (metric == "abs" and log10) else
-            r"$\log_{10}(H^2)$" if (metric == "sq" and log10) else
-            r"$|H(x)|$" if metric == "abs" else
-            r"$H(x)^2$")
-    ax.set_ylabel(ylab)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    if title:
-        ax.set_title(title)
-
-    _save_fig(fig, savepath)
-    return fig
-
-
-def plot_value_flow(
-    *,
-    config,
-    controllers,                  # [("LQR", config.ocp.LQR), ("ctrl1", ctrl1)]  (each must have eval_U)
-    x0=None,                      # (d,) or (d,1) numpy; if None, sampled
-    seed: int = 0,
+    controllers,
+    # Parameters for plot_value_vs_state_norm
+    n=1000,
+    seed=0,
     dist=None,
-    tspan=(0.0, 30.0),
-    Nt: int = 400,
+    n_quad=32,
+    device="cpu",
+    alpha=0.25,
+    s=6,
+    # Parameters for plot_value_flow
+    x0=None,
+    tspan=(0.0, 1.0),
+    Nt=400,
     solver="LSODA",
     events="auto",
-    device="cpu",
-    n_quad: int = 64,             # only used if V reconstructed from grad_net
-    bump_tol: float = 0.0,        # mark bumps where V(t_k)-V(t_{k-1}) > bump_tol
-    mark_bumps: bool = True,
-    colors=("#56B4E9", "#7B2CBF"),  # light blue, purple
-    title: str | None = None,
-    figsize=(6.4, 3.2),
+    bump_tol=0.0,
+    mark_bumps=True,
+    # Parameters for plot_hjb_residual_shock_line
+    shock=None,
+    shock_seed=0,
+    s_grid=None,
+    dist_for_shock=1.0,
+    metric="abs",
+    log10=False,
+    eps=1e-12,
+    # Combined parameters
+    title=None,
+    figsize=(6.2, 9.6),  # 3 plots stacked vertically
     savepath=None,
 ):
     """
-    Value flow plot: time t vs V(x(t)) along a CLOSED-LOOP trajectory.
-
-    - Simulates x(t) with sim_closed_loop using controller.eval_U.
-    - Evaluates V(x(t)) using:
-        * controller.eval_V(X) if available (e.g. LQR), else
-        * reconstructs V from controller.grad_net via V_from_gradnet_line_integral
-          (through _value_from_controller_or_gradnet).
+    Creates three separate plots and saves each as a PNG file:
+    1. Value vs state norm (scatter)
+    2. Value flow along trajectory (line)
+    3. HJB residual shock line (line)
+    
+    Ensures consistent colors across all three plots for each controller.
+    If savepath is provided, generates three PNG files with suffixes:
+    - {savepath}_value_vs_norm.png
+    - {savepath}_value_flow.png
+    - {savepath}_hjb_residual.png
     """
-    # --- initial condition ---
+    from controls.train import loss_unified
+    
+    # Normalize controllers to list of (name, controller) tuples
+    controller_list = list(_iter_named_controllers(controllers))
+    n_controllers = len(controller_list)
+    
+    # Create consistent color mapping using matplotlib's default cycle
+    # Get the default color cycle
+    prop_cycle = plt.rcParams['axes.prop_cycle']
+    colors_list = prop_cycle.by_key()['color']
+    # Extend if needed
+    while len(colors_list) < n_controllers:
+        colors_list.extend(colors_list)
+    
+    # Create color map: name -> color
+    color_map = {name: colors_list[k] for k, (name, _) in enumerate(controller_list)}
+    
+    # Generate savepaths for 3 separate PNG files
+    def _make_savepath(base_path, suffix):
+        if base_path is None:
+            return None
+        p = Path(base_path)
+        # Replace extension with .png and add suffix
+        stem = p.stem
+        parent = p.parent
+        return str(parent / f"{stem}_{suffix}.png")
+    
+    savepath1 = _make_savepath(savepath, "value_vs_norm")
+    savepath2 = _make_savepath(savepath, "value_flow")
+    savepath3 = _make_savepath(savepath, "hjb_residual")
+    
+    # Individual figure size for each plot
+    individual_figsize = (6.2, 3.2)
+    
+    # ============================================================
+    # Plot 1: Value vs State Norm
+    # ============================================================
+    X = sample_conditions(config, n=int(n), seed=int(seed), dist=dist)  # (d,N)
+    xnorm = np.asarray(config.ocp.norm(X)).reshape(-1)
+    
+    fig1, ax1 = plt.subplots(figsize=individual_figsize, constrained_layout=True)
+    for name, ctrl in controller_list:
+        V = _value_from_controller_or_gradnet(ctrl, X, device=device, n_quad=n_quad)
+        color = color_map[name]
+        ax1.scatter(xnorm, V, s=float(s), alpha=float(alpha), label=str(name), color=color)
+    
+    _ymin, _ymax = ax1.get_ylim()
+    ax1.set_ylim(0.0, max(0.0, float(_ymax)))
+    ax1.set_xlabel(r"$\|x\|_w$")
+    ax1.set_ylabel(r"$V(x)$")
+    ax1.set_title("Value vs State Norm")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+    _save_fig(fig1, _with_system_figures_subdir(savepath1, config))
+    
+    # ============================================================
+    # Plot 2: Value Flow
+    # ============================================================
     if x0 is None:
         X0 = sample_conditions(config, n=1, seed=int(seed), dist=dist)  # (d,1)
         x0 = X0[:, 0]
     x0 = np.asarray(x0).reshape(-1)
-
-    # --- time grid ---
+    
     t_eval = np.linspace(float(tspan[0]), float(tspan[1]), int(Nt))
-
-    # --- events ---
+    
     if events == "auto":
         if hasattr(config, "ocp") and hasattr(config.ocp, "make_integration_events"):
             events = config.ocp.make_integration_events()
         else:
             events = None
-
-    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
-
-    for k, (name, ctrl) in enumerate(_iter_named_controllers(controllers)):
-        # simulate closed loop
+    
+    fig2, ax2 = plt.subplots(figsize=individual_figsize, constrained_layout=True)
+    for name, ctrl in controller_list:
+        color = color_map[name]
         t, X, status = sim_closed_loop(
             config.ocp.dynamics,
             config.ocp.closed_loop_jacobian,
@@ -536,27 +580,108 @@ def plot_value_flow(
             events=events,
             solver=solver,
         )  # X: (d, Nt_eff)
-
-        # evaluate V along trajectory (Nt_eff,)
+        
         V = _value_from_controller_or_gradnet(ctrl, X, device=device, n_quad=int(n_quad))
-
-        ax.plot(t, V, label=str(name))
-
+        ax2.plot(t, V, label=str(name), color=color)
+        
         if mark_bumps and V.size >= 2:
             dV = np.diff(V)
             bump_idx = np.where(dV > float(bump_tol))[0] + 1
             if bump_idx.size > 0:
-                ax.plot(t[bump_idx], V[bump_idx], "o", ms=3.5, alpha=0.9)
+                ax2.plot(t[bump_idx], V[bump_idx], "o", ms=3.5, alpha=0.9, color=color)
+    
+    ax2.set_xlabel(r"$t$")
+    ax2.set_ylabel(r"$V(x(t))$")
+    ax2.set_title("Value Flow")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+    _save_fig(fig2, _with_system_figures_subdir(savepath2, config))
+    
+    # ============================================================
+    # Plot 3: HJB Residual Shock Line
+    # ============================================================
+    if s_grid is None:
+        s_grid = np.linspace(0.0, 2.0, 20)
+    s_grid = np.asarray(s_grid, dtype=float).reshape(-1)
+    
+    d = int(config.n_states)
+    
+    if shock is None:
+        Xs = sample_conditions(config, n=1, seed=int(shock_seed), dist=float(dist_for_shock))  # (d,1)
+        shock = Xs[:, 0]
+    shock = np.asarray(shock, dtype=float).reshape(-1)
+    if shock.size != d:
+        raise ValueError(f"shock must have shape ({d},)")
+    
+    class _LQRAsGradModel:
+        """Shim so train.py loss can call model(X)->dVdX and access model.config."""
+        def __init__(self, config):
+            self.config = config
+        
+        def __call__(self, X):  # X: (B,d) torch
+            G = self.config.ocp.LQR.eval_dVdX(X.detach().cpu().numpy().T)  # (d,B) numpy
+            return torch.tensor(G.T, dtype=X.dtype, device=X.device)       # (B,d)
+    
+    def _as_grad_model(obj):
+        if hasattr(obj, "eval_dVdX"):
+            return _LQRAsGradModel(config)
+        if hasattr(obj, "grad_net") and (obj.grad_net is not None):
+            obj = obj.grad_net
+        if not hasattr(obj, "config"):
+            raise ValueError(
+                "For non-LQR, pass the GradNet itself (e.g. ctrl.grad_net or model), "
+                "not a string or a controller without gradient information."
+            )
+        return obj
+    
+    fig3, ax3 = plt.subplots(figsize=individual_figsize, constrained_layout=True)
+    for name, obj in controller_list:
+        color = color_map[name]
+        model = _as_grad_model(obj)
+        ys = []
+        for s in s_grid:
+            Xnp = shock[:, None] * float(s)                               # (d,1)
+            Xt = torch.tensor(Xnp.T, dtype=torch.float32, device=device)  # (1,d)
+            
+            total, hjb_err, dpc_err, sup_err = loss_unified(
+                model,
+                (Xt,),
+                mode="unsupervised",
+                supervision=False,
+            )
+            
+            hjb_sq = hjb_err
+            val = float(hjb_sq.detach().cpu().numpy())
+            
+            if metric == "abs":
+                val = np.sqrt(val + float(eps))
+            elif metric == "sq":
+                pass
+            else:
+                raise ValueError("metric must be 'abs' or 'sq'")
+            
+            if log10:
+                val = np.log10(val + float(eps))
+            
+            ys.append(val)
+        
+        ax3.plot(s_grid, ys, label=str(name), color=color)
+    
+    ax3.set_xlabel(r"shock intensity $s$ (state $x = s\,x_{\mathrm{shock}}$)")
+    ylab = (r"$\log_{10}(|H|)$" if (metric == "abs" and log10) else
+            r"$\log_{10}(H^2)$" if (metric == "sq" and log10) else
+            r"$|H(x)|$" if metric == "abs" else
+            r"$H(x)^2$")
+    ax3.set_ylabel(ylab)
+    ax3.set_title("HJB Residual")
+    ax3.grid(True, alpha=0.3)
+    ax3.legend()
+    _save_fig(fig3, _with_system_figures_subdir(savepath3, config))
+    
+    return fig1, fig2, fig3
 
-    ax.set_xlabel(r"$t$")
-    ax.set_ylabel(r"$V(x(t))$")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    if title:
-        ax.set_title(title)
 
-    _save_fig(fig, savepath)
-    return fig
+
 def plot_space_time_heatmap(
     *,
     config,
@@ -564,7 +689,7 @@ def plot_space_time_heatmap(
     x0=None,                     # (d,) or (d,1); if None, sampled
     seed: int = 0,
     dist=None,
-    tspan=(0.0, 30.0),
+    tspan=(0.0, 10.0),
     Nt: int = 350,
     solver="LSODA",
     events="auto",
@@ -636,7 +761,7 @@ def plot_space_time_heatmap(
     cb = fig.colorbar(im, ax=ax, pad=0.02)
     cb.set_label(r"$x(t,\xi)$")
 
-    _save_fig(fig, savepath)
+    _save_fig(fig, _with_system_figures_subdir(savepath, config))
     return fig
 
 def plot_gradient_attention_heatmap(
@@ -724,7 +849,7 @@ def plot_gradient_attention_heatmap(
     cb = fig.colorbar(im, ax=ax, pad=0.02)
     cb.set_label(lab)
 
-    _save_fig(fig, savepath)
+    _save_fig(fig, _with_system_figures_subdir(savepath, config))
     return fig
 
 def plot_training_losses(
@@ -739,6 +864,7 @@ def plot_training_losses(
     ylabel: str = "loss",
     figsize=(6.2, 3.2),
     savepath=None,
+    config=None,
     # NEW: multi-series support (preferred)
     series=None,  # list of (name, iters, losses)
     # NEW:
@@ -746,11 +872,6 @@ def plot_training_losses(
     ema_alpha: float = 0.03,        # for EMA
     ma_window: int = 200,           # for moving average
 ):
-    if series is None:
-        if iters is None or losses is None:
-            raise ValueError("Provide either (iters, losses) or series=[(name,iters,losses), ...].")
-        series = [(label, iters, losses)]
-
     # Allow passing history dicts: (name, history_dict) or (name, iters, losses, phase)
     norm_series = []
     for item in series:
@@ -766,35 +887,44 @@ def plot_training_losses(
         else:
             raise ValueError("Each series entry must be (name,iters,losses), (name,history_dict), or (name,iters,losses,phase).")
 
-    # Align phases on a shared timeline:
-    # - supervised segments start at 1
-    # - unsupervised-only runs can be shifted by the maximum supervised length across series
-    sup_lengths = []
-    for name_k, it_k, _lo_k, ph_k in norm_series:
-        if it_k is None:
-            continue
-        it_k = np.asarray(it_k).reshape(-1)
-        if ph_k is not None:
-            ph = np.asarray(ph_k).reshape(-1)
-            if ph.size == it_k.size:
-                sup_lengths.append(int(np.sum(ph == "sup")))
-        elif "supervised" in str(name_k).lower() or str(name_k).lower().strip() == "sup":
-            sup_lengths.append(int(it_k.size))
-    global_k = int(max(sup_lengths)) if sup_lengths else 0
-
+    # Extract unsupervised phases and reset iterations - SAME for ALL controllers
     fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
     for k, (name_k, it_k, lo_k, ph_k) in enumerate(norm_series):
+        if it_k is None or lo_k is None:
+            continue
+            
         it_k = np.asarray(it_k).reshape(-1)
         lo_k = np.asarray(lo_k).reshape(-1)
 
-        # optional alignment: shift pure-unsupervised runs by global supervised length
-        if global_k > 0 and ph_k is None:
-            nm = str(name_k).lower()
-            is_unsup = ("unsup" in nm) or ("unsupervised" in nm)
-            is_sup = ("supervised" in nm) or (nm.strip() == "sup")
-            if is_unsup and (not is_sup) and (it_k.size > 0) and int(it_k[0]) == 1:
-                it_k = it_k + global_k
+        # For ALL controllers: extract unsupervised phase (if phase info exists)
+        if ph_k is not None:
+            ph = np.asarray(ph_k).reshape(-1)
+            if ph.size == it_k.size:
+                unsup_mask = (ph != "sup")
+                if not np.any(unsup_mask):
+                    continue  # Skip if all supervised
+                it_k = it_k[unsup_mask]
+                lo_k = lo_k[unsup_mask]
+        elif "hybrid" in str(name_k).lower():
+            # For hybrid models without phase info (old checkpoints):
+            # Detect phase boundary by looking for a jump in iterations
+            # Supervised phase has consecutive iterations, then unsupervised starts at higher number
+            if len(it_k) > 1:
+                diffs = np.diff(it_k)
+                # Find large jump (likely boundary between sup and unsup)
+                large_jump_idx = np.where(diffs > np.percentile(diffs, 90))[0]
+                if len(large_jump_idx) > 0:
+                    # Assume everything after the first large jump is unsupervised
+                    unsup_start = large_jump_idx[0] + 1
+                    it_k = it_k[unsup_start:]
+                    lo_k = lo_k[unsup_start:]
+        
+        # For ALL controllers: reset iterations to start at 1
+        if len(it_k) == 0:
+            continue
+        it_k = it_k - it_k[0] + 1
 
+        # Smooth and plot - SAME for ALL
         if smooth is None:
             it_plot, y_plot = it_k, lo_k
         elif smooth == "ema":
@@ -827,5 +957,5 @@ def plot_training_losses(
         ax.set_title(title)
     ax.grid(True, which="both", alpha=0.3)
     ax.legend()
-    _save_fig(fig, savepath)
-    return fig
+    _save_fig(fig, _with_system_figures_subdir(savepath, config))
+    return fig, ax

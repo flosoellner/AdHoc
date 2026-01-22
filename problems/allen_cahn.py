@@ -47,7 +47,7 @@ class AllenCahnOCP(BaseOCP):
         n_controls = int(config.n_controls)
 
         # physics params (match your legacy defaults)
-        self.nu = 0.017
+        self.nu = 0.025
         self.R = 0.5
 
         # operators + quadrature weights
@@ -70,12 +70,19 @@ class AllenCahnOCP(BaseOCP):
             for j, idx in enumerate(parts):
                 B[idx, j] = 1.0
 
-        # linearization point
-        X_bar = np.zeros((n_states, 1))
+        # linearization point - target stable steady state (-1 or 1)
+        # Using -1 as default (both -1 and 1 are stable)
+        target_value = 0.0 # -1.0 or 1.0
+        X_bar = np.full((n_states, 1), target_value)
         U_bar = np.zeros((n_controls, 1))
 
-        # linearized dynamics at x=0:  x_t = nu D2 x + x + B u
-        A = self.nu * self.D2 + np.eye(n_states)
+        # linearized dynamics at x = X_bar (stable steady state)
+        # d/dx (x - x^3) = 1 - 3x^2
+        # At x = -1: 1 - 3(-1)^2 = 1 - 3 = -2
+        # At x = 1:  1 - 3(1)^2 = 1 - 3 = -2
+        # So A = nu*D2 + diag(-2) = nu*D2 - 2*I (stable!)
+        diag_term = 1.0 - 3.0 * (target_value ** 2)  # = -2 for ±1
+        A = self.nu * self.D2 + diag_term * np.eye(n_states)
 
         # cost matrices (state weight uses quadrature weights)
         Q = np.diag(self.w_flat)
@@ -96,6 +103,54 @@ class AllenCahnOCP(BaseOCP):
         self.B = self._B
         # optimal control map used by BaseOCP.U_star: U* = RBT @ dVdX
         self.RBT = -self._B.T / (2.0 * self.R)   # shape (m,n)
+
+    def running_cost(self, X, U, wX=None):
+        """
+        Running cost L(X,U) = ||X - X_bar||^2_w + R||U||^2
+        Penalizes distance from target steady state X_bar.
+        """
+        X = X.reshape(self.n_states, -1)
+        U = U.reshape(self.n_controls, -1)
+        
+        # Compute X - X_bar
+        X_err = X - self.X_bar
+        
+        if wX is None:
+            if X.ndim == 1:
+                wX_err = self.w_flat * X_err.flatten()
+            else:
+                wX_err = self.w * X_err
+        else:
+            # If wX provided, it should be w * X, so convert to w * (X - X_bar)
+            wX_err = wX - (self.w * self.X_bar)
+        
+        return np.sum(wX_err * X_err, axis=0) + self.R * np.sum(U**2, axis=0)
+
+    def running_cost_gradient(self, X, U, return_dLdX=True, return_dLdU=True):
+        """
+        Gradient of running cost: dL/dX = 2*w*(X - X_bar), dL/dU = 2*R*U
+        """
+        X = X.reshape(self.n_states, -1)
+        U = U.reshape(self.n_controls, -1)
+        X_err = X - self.X_bar
+        
+        dLdX = None
+        dLdU = None
+        
+        if return_dLdX:
+            if X.ndim == 1:
+                dLdX = 2.0 * (self.w_flat * X_err.flatten())
+            else:
+                dLdX = 2.0 * (self.w * X_err)
+            if not return_dLdU:
+                return dLdX
+        
+        if return_dLdU:
+            dLdU = 2.0 * self.R * U
+            if not return_dLdX:
+                return dLdU
+        
+        return dLdX, dLdU
 
     def dynamics(self, X, U):
         """
@@ -148,16 +203,17 @@ class AllenCahnOCP(BaseOCP):
         dXdt = (self.nu * (self.D2 @ X)) + X - (X ** 3) + (self.B @ U)
 
         # costate dynamics: dA/dt = -∂H/∂X = -∂L/∂X - (∂f/∂X)^T A
-        # Here L uses BaseOCP.running_cost => dL/dX = 2 w X (w is quadrature weights)
-        wX = self.w * X                        # (n,N)
-        dLdX = 2.0 * wX                        # (n,N)
+        # Here L penalizes distance from X_bar => dL/dX = 2 w (X - X_bar)
+        X_err = X - self.X_bar                 # (n,N)
+        wX_err = self.w * X_err                # (n,N)
+        dLdX = 2.0 * wX_err                    # (n,N)
 
         # ∂f/∂X = nu D2 + diag(1 - 3 X^2)
         # so (∂f/∂X)^T A = (nu D2^T) A + diag(1 - 3X^2) A
         dAdt = -dLdX - (self.nu * (self.D2.T @ A)) - ((1.0 - 3.0 * (X ** 2)) * A)
 
-        # running cost (1,N)
-        L = np.atleast_2d(self.running_cost(X, U, wX))
+        # running cost (1,N) - pass wX_err for consistency
+        L = np.atleast_2d(self.running_cost(X, U, wX_err))
 
         return np.vstack((dXdt, dAdt, -L))
 
@@ -173,6 +229,7 @@ class AllenCahnPhysics(torch.nn.Module):
         self.register_buffer("D2", torch.from_numpy(ocp.D2).float())
         self.register_buffer("B", torch.from_numpy(ocp.B).float())
         self.register_buffer("w", torch.from_numpy(ocp.w_flat).float())
+        self.register_buffer("X_bar", torch.from_numpy(ocp.X_bar).float())
 
         self.nu = float(ocp.nu)
         self.R_val = float(ocp.R)
@@ -188,6 +245,10 @@ class AllenCahnPhysics(torch.nn.Module):
         return f.t()
 
     def running_cost(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-        state_cost = (self.w * (x ** 2)).sum(dim=1)
+        # Penalize distance from X_bar (stable steady state)
+        # x is (B, n), X_bar is (n_states, 1), need to reshape to (1, n) for broadcasting
+        X_bar_flat = self.X_bar.squeeze(1)  # (n_states,)
+        x_err = x - X_bar_flat.unsqueeze(0)  # (B, n)
+        state_cost = (self.w * (x_err ** 2)).sum(dim=1)
         control_cost = self.R_val * (u ** 2).sum(dim=1)
         return state_cost + control_cost

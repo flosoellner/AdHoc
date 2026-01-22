@@ -10,181 +10,40 @@ import itertools
 
 @dataclass
 class TrainConfig:
-    sup_epochs: int = 3
-    sup_lr: float = 1e-3
-    unsup_epochs: int = 30
-    unsup_lr: float = 1e-4
+    sup_epochs: int = 1
+    sup_n_steps: int = None
+    sup_lr: float = 1e-5 # 
+    unsup_epochs: int = 5
+    unsup_n_steps: int = 30 
+    unsup_lr: float = 5e-4 # 
     batch_size: int = None
     device: str = "cpu"
     log_every: int = 1
     grad_clip: float | None = None
-
-# add new knobs to TrainConfig if you want:
-
-bs_max = 256
-bs_warmup_epochs = 1
-D0 = 0.5
-C = 0.2
-M = 1.15
-
-def save_model(path, *, config, grad_net=None, value_net=None, extra=None, history=None):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    ckpt = {
-        "meta": {
-            "system": config.system,
-            "n_states": config.n_states,
-            "n_controls": config.n_controls,
-            "seed": config.seed,
-            "extra": extra or {},
-        },
-        "grad_net": grad_net.state_dict() if grad_net is not None else None,
-        "value_net": value_net.state_dict() if value_net is not None else None,
-    }
-    history_to_save = None if history is None else {
-        "iters": list(history["iters"]),
-        "loss": list(history["loss"]),
-    }
-    ckpt["history"] = history_to_save
-    torch.save(ckpt, path)
+    # -------------------------
+    # Adaptive batch sizing (unsupervised/hybrid)
+    # -------------------------
+    bs_max: int = 256
+    adaptive_init_frac: float = 1.0           # initial batch = ceil(nominal * frac)
+    adaptive_bs_max_factor: float = 1.0        # max batch = factor * initial batch (adaptive=True)
+    adaptive_D0: float = 0.0              # threshold for heuristic
+    adaptive_C: float = 0.0002                    # heuristic scaling
+    adaptive_M: float = 1.3                  # batch growth multiplier
+    # -------------------------
+    # Horizon growth parameters
+    # -------------------------
+    horizon_initial: int = 250      # initial rollout horizon
+    horizon_max: int = 4000                  # maximum horizon (never exceed)
+    horizon_growth_factor: float = 1.00      # multiply horizon by this each epoch (1.0 = no growth)
+    # -------------------------
+    # Loss weighting
+    # -------------------------
+    lambda_sup_base: float = 0.5            # Base supervised penalty weight (decays to 0)
+    sup_err_scale: float = 10.0             # Scale factor for supervised MSE to match HJB magnitude
 
 
-def load_gradnet(path, *, config, device="cpu"):
-    from controls.nn import GradNet
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-
-    if ckpt.get("grad_net") is None:
-        raise ValueError(f"No grad_net weights in checkpoint: {path}")
-
-    sd = ckpt["grad_net"]
-    sd = {k: v for k, v in sd.items() if not k.startswith("_physics.")}
-
-    # Backward compatibility:
-    # - older checkpoints: plain nn.Sequential MLP -> "net.0.*", "net.2.*", ...
-    # - current default: residual net -> "net.inp.*", "net.blocks.*", "net.out.*"
-    has_sequential_style = any(k.startswith("net.0.") for k in sd.keys())
-    has_resmlp_style = any(k.startswith("net.inp.") for k in sd.keys())
-
-    if has_sequential_style and (not has_resmlp_style):
-        grad_net = GradNet(config, residual=False).to(device)
-    else:
-        grad_net = GradNet(config).to(device)
-
-    grad_net.load_state_dict(sd, strict=True)
-    grad_net.eval()
-
-    hist = ckpt.get("history")
-    if hist is not None:
-        hist = {"iters": np.asarray(hist["iters"]), "loss": np.asarray(hist["loss"])}
-    return grad_net, ckpt.get("meta", {}), hist
-
-def train_or_load_gradnet(
-    *,
-    config,
-    kind: str,
-    use_lqr: bool,
-    train_mode: str,            # "supervised" | "unsupervised" | "hybrid"
-    adaptive: bool = False, 
-    supervision: bool = False,
-    train_cfg: TrainConfig,
-    train_loader=None,
-    ckpt_dir: str = "./saved_models",
-    force_retrain: bool = False,
-    device: str = "cpu",
-    data=None,
-):
-    os.makedirs(ckpt_dir, exist_ok=True)
-    ckpt_path = os.path.join(
-        ckpt_dir,
-        f"{kind}_useLQR{int(use_lqr)}_{train_mode}_adapt{int(adaptive)}_sup{int(supervision)}"
-        f"_d{config.n_states}_m{config.n_controls}_seed{config.seed}.pt"
-    )
-
-    if (not force_retrain) and os.path.exists(ckpt_path):
-        grad_net, meta, history = load_gradnet(ckpt_path, config=config, device=device)
-        return (grad_net, meta, history)
-
-    grad_net = GradNet(config, use_lqr=use_lqr).to(device)
-
-    sup_cfg   = SimpleNamespace(**vars(train_cfg), epochs=train_cfg.sup_epochs,   lr=train_cfg.sup_lr)
-    unsup_cfg = SimpleNamespace(**vars(train_cfg), epochs=train_cfg.unsup_epochs, lr=train_cfg.unsup_lr)
-
-    history = None
-
-    # before calling train_loop in unsupervised / hybrid-unsup:
-    sup_loader = None
-    if supervision:
-        if data is None:
-            raise ValueError("supervision=True requires `data` (X,dVdX)")
-        sup_loader = make_loader_XG(data, train_cfg, shuffle=True)
-
-
-    if train_mode == "supervised":
-        if data is None:
-            raise ValueError("supervised requires data")
-
-
-        grad_net, history = train_loop(
-            grad_net,
-            make_loader_XG(data, train_cfg),
-            loss_unified,
-            sup_cfg,
-            mode="supervised",
-        )
-
-
-    elif train_mode == "unsupervised":
-
-            # unsupervised call:
-            grad_net, history = train_loop(
-                grad_net, None, loss_unified, unsup_cfg,
-                mode="unsupervised", config=config, adaptive=adaptive,
-                supervision=supervision, sup_loader=sup_loader, sup_every=1,
-            )
-
-
-
-    elif train_mode == "hybrid":
-        if data is None:
-            raise ValueError("hybrid requires data")
-
-
-        grad_net, hist_sup = train_loop(
-            grad_net,
-            make_loader_XG(data, train_cfg),
-            loss_unified,
-            sup_cfg,
-            mode="supervised",
-        )
-        grad_net, hist_unsup = train_loop(
-            grad_net,
-            None,
-            loss_unified,
-            unsup_cfg,
-            mode="unsupervised",
-            config=config,
-            adaptive=adaptive,
-            supervision=supervision,
-            sup_loader=sup_loader,
-            sup_every=1,
-        )
-
-        it_sup, lo_sup = hist_sup["iters"], hist_sup["loss"]
-        it_uns, lo_uns = hist_unsup["iters"], hist_unsup["loss"]
-        offset = int(it_sup[-1]) if len(it_sup) else 0
-
-        history = {
-            "iters": np.concatenate([it_sup, it_uns + offset]),
-            "loss":  np.concatenate([lo_sup, lo_uns]),
-            "phase": np.array((["sup"] * len(it_sup)) + (["unsup"] * len(it_uns))),
-        }
-
-    else:
-        raise ValueError("train_mode must be 'supervised', 'unsupervised', or 'hybrid'")
-
-    meta_out = {"kind": kind, "use_lqr": use_lqr, "train_mode": train_mode, "adaptive": adaptive, "supervision": supervision}
-    save_model(ckpt_path, config=config, grad_net=grad_net, value_net=None, extra=meta_out, history=history)
-
-    return (grad_net, meta_out, history)
+# Model factory functions moved to controls.model_factory
+from controls.model_factory import save_model, load_gradnet, train_or_load_gradnet
 
 
 
@@ -218,7 +77,7 @@ def make_loader_XG(dataset, cfg: TrainConfig, shuffle=True):
 # -------------------------
 # Generic training loop
 # -------------------------
-import itertools  # make sure this exists at file top
+
 
 def train_loop(
     model,
@@ -228,12 +87,12 @@ def train_loop(
     *,
     optimizer=None,
     mode: str = None,
-    n_steps: int = 500,
     config=None,
     adaptive: bool = False,
     supervision: bool | None = None,
     sup_loader=None,
-    sup_every: int = 1,
+    sup_every: int = 500,
+    val_loader=None,  # NEW: validation loader
 ):
     import numpy as np
 
@@ -245,10 +104,45 @@ def train_loop(
         raise ValueError("mode must be 'supervised' or 'unsupervised'")
 
     iters, losses, step = [], [], 0
+    val_mses = []  # NEW: track validation MSE per epoch
 
     # -------------------------
     # supervised (EARLY RETURN)
     # -------------------------
+def train_loop(
+    model,
+    loader,
+    loss_fn,
+    cfg: TrainConfig,
+    *,
+    optimizer=None,
+    mode: str = None,
+    config=None,
+    adaptive: bool = False,
+    supervision: bool | None = None,  # Add this parameter
+    sup_loader=None,
+    sup_every: int = 2000,
+    val_loader=None,
+):
+    import numpy as np
+
+    model = model.to(cfg.device) if hasattr(model, "to") else model
+    
+    if mode not in {"supervised", "unsupervised"}:
+        raise ValueError("mode must be 'supervised' or 'unsupervised'")
+    
+    # Initialize optimizer with the correct learning rate based on mode
+    if optimizer is None:
+        if mode == "supervised":
+            lr = getattr(cfg, 'sup_lr', getattr(cfg, 'lr', 5e-4))
+        else:  # unsupervised
+            lr = getattr(cfg, 'unsup_lr', getattr(cfg, 'lr', 1e-4))
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    iters, losses, phases, step = [], [], [], 0
+    val_mses = []
+    # ... existing code ...
+
     if mode == "supervised":
         if loader is None:
             raise ValueError("supervised mode requires `loader`")
@@ -256,8 +150,6 @@ def train_loop(
         for ep in range(1, cfg.epochs + 1):
             model.train()
 
-
-            # inside: for ep in range(1, cfg.epochs + 1):
             sum_total = 0.0
             sum_hjb = 0.0
             sum_dpc = 0.0
@@ -267,7 +159,16 @@ def train_loop(
             for batch in loader:
                 batch = tuple(b.to(cfg.device) for b in batch)
 
-                loss, hjb_err, dpc_err, sup_err = loss_fn(model, batch, mode="supervised", supervision=True)
+                # Normalize lambdas: supervised pretraining uses lambda_hjb=0.0, lambda_sup=1.0
+                lambda_hjb_norm, lambda_sup_norm = normalize_lambdas(0.0, 1.0)
+                loss, hjb_err, dpc_err, sup_err = loss_fn(
+                    model, batch, 
+                    mode="supervised", 
+                    supervision=supervision if supervision is not None else False,
+                    lambda_hjb=lambda_hjb_norm,
+                    lambda_sup=lambda_sup_norm,
+                    sup_err_scale=cfg.sup_err_scale
+                )
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -285,11 +186,38 @@ def train_loop(
                 step += 1
                 iters.append(step)
                 losses.append(float(loss.item()))
+                phases.append("sup")  # Mark all supervised iterations
+
+            # ... rest of existing code (validation, logging) ...
+
+            # NEW: Compute validation MSE
+            val_mse = None
+            if val_loader is not None:
+                model.eval()
+                val_mse_sum = 0.0
+                val_n = 0
+                with torch.no_grad():
+                    for batch in val_loader:
+                        batch = tuple(b.to(cfg.device) for b in batch)
+                        if len(batch) >= 2 and batch[1] is not None:
+                            X_val, G_val = batch[0], batch[1]
+                            pred = model(X_val)
+                            mse = nn.functional.mse_loss(pred, G_val, reduction='sum')
+                            val_mse_sum += float(mse.item())
+                            val_n += X_val.shape[0]
+                if val_n > 0:
+                    val_mse = val_mse_sum / val_n
+                    val_mses.append(val_mse)
+                model.train()
 
             if (ep % cfg.log_every) == 0:
-                print(f"epoch {ep:04d} | loss={sum_total/n:.2e} | bs={int(cfg.batch_size)} | heur=nan")
+                bs_disp = "None" if cfg.batch_size is None else str(int(cfg.batch_size))
+                val_str = f" | val_mse={val_mse:.2e}" if val_mse is not None else " | val_mse=nan"
+                print(f"epoch {ep:04d} | loss={sum_total/n:.2e} | hjb={sum_hjb/n:.2e} | sup={sum_sup/n:.2e} | bs={bs_disp} | heur=nan{val_str}")
 
-        history = {"iters": np.asarray(iters), "loss": np.asarray(losses)}
+        history = {"iters": np.asarray(iters), "loss": np.asarray(losses), "phase": np.asarray(phases)}
+        if val_mses:
+            history["val_mse"] = np.asarray(val_mses)
         return model, history
 
     # -------------------------
@@ -304,11 +232,11 @@ def train_loop(
         if cfg.batch_size is None:
             raise ValueError("adaptive=True requires cfg.batch_size to be set")
         _nominal_bs = int(cfg.batch_size)
-        _init_bs = max(1, int(np.ceil(_nominal_bs / 4.0)))
+        _init_bs = max(1, int(np.ceil(_nominal_bs * float(cfg.adaptive_init_frac))))
         cfg.batch_size = _init_bs
-        _bs_max_local = int(4 * _init_bs)
+        _bs_max_local = int(float(cfg.adaptive_bs_max_factor) * _init_bs)
     else:
-        _bs_max_local = int(bs_max)
+        _bs_max_local = int(cfg.bs_max)
 
     def sample_X():
         if not adaptive:
@@ -318,7 +246,19 @@ def train_loop(
 
     sup_iter = itertools.cycle(sup_loader) if (sup_loader is not None) else None
 
+    # Compute total steps for smooth decay
+    total_steps = cfg.epochs * cfg.unsup_n_steps
+    global_step = 0
+    lambda_hjb_base = 1.0  # Base HJB weight (always 1.0)
+    
+    # Initialize phases list for unsupervised mode
+    phases = []
+
     for ep in range(1, cfg.epochs + 1):
+
+        current_lr = cfg.unsup_lr / ep**2
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = current_lr
         model.train()
         sum_total = 0.0
         sum_hjb = 0.0
@@ -327,20 +267,45 @@ def train_loop(
         n = 0
         gnorms = []
 
-        for step_i in range(n_steps):
+        # Compute horizon for this epoch (exponentially grow)
+        current_horizon = min(
+            int(cfg.horizon_initial * (cfg.horizon_growth_factor ** (ep - 1))),
+            cfg.horizon_max
+        )
+
+        for step_i in range(cfg.unsup_n_steps):
+            # Compute lambda_sup: smooth linear decay from lambda_sup_base to 0
+            progress = global_step / total_steps  # 0 to 1 over all steps
+            lambda_sup_current = cfg.lambda_sup_base * (1.0 - progress)
+            lambda_sup_current = max(0.0, lambda_sup_current)
+            
+            # Normalize lambdas so they sum to 1.0
+            lambda_hjb_norm, lambda_sup_norm = normalize_lambdas(lambda_hjb_base, lambda_sup_current)
+
             X_np = sample_X()
             X = torch.tensor(X_np.T, dtype=torch.float32, device=cfg.device)
 
-            # unsupervised loop (inside for step_i in range(n_steps):)
-            loss, hjb_err, dpc_err, sup_err = loss_fn(model, (X,), mode=mode, supervision=False)
+            # unsupervised loop - use normalized lambdas
+            loss, hjb_err, dpc_err, sup_err = loss_fn(
+                model, (X,), mode=mode, supervision=False, 
+                horizon=current_horizon, lambda_hjb=lambda_hjb_norm,
+                sup_err_scale=cfg.sup_err_scale
+            )
 
-            # optional supervised injection (adds sup-only loss; no subtraction hack needed)
+            # optional supervised injection with decaying lambda_sup
             if supervision and (sup_iter is not None) and ((sup_every <= 1) or (step_i % int(sup_every) == 0)):
                 Xs, Gs = next(sup_iter)
                 Xs = Xs.to(cfg.device); Gs = Gs.to(cfg.device)
-                sup_total, _, _, sup_only = loss_fn(model, (Xs, Gs), mode=mode, supervision=True)
-                loss = loss + sup_total
-                sup_err = sup_err + sup_only  # so logging shows the injected supervised amount
+                # Get supervised MSE error (HJB already computed in main loss)
+                _, _, _, sup_only = loss_fn(
+                    model, (Xs, Gs), mode=mode, supervision=True, 
+                    horizon=current_horizon, lambda_hjb=lambda_hjb_norm, lambda_sup=lambda_sup_norm,
+                    sup_err_scale=cfg.sup_err_scale
+                )
+                # Only add the supervised MSE penalty: lambda_sup_norm * sup_err_scale * sup_err
+                sup_penalty = lambda_sup_norm * cfg.sup_err_scale * sup_only
+                loss = loss + sup_penalty
+                sup_err = sup_err + sup_only
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -356,8 +321,10 @@ def train_loop(
                 gnorms.append(s2 ** 0.5)
 
             step += 1
+            global_step += 1  # Increment global step counter
             iters.append(step)
             losses.append(float(loss.item()))
+            phases.append("unsup")  # Mark all unsupervised iterations
             bs = X.shape[0]
             sum_total += float(loss.item()) * bs
             sum_hjb   += float(hjb_err.item()) * bs
@@ -365,22 +332,45 @@ def train_loop(
             sum_sup   += float(sup_err.item()) * bs
             n += bs
 
+        # ... rest of existing code (validation, logging, etc.) ...
+
         g = np.asarray(gnorms, dtype=float)
         mu = float(np.mean(g)) if g.size else 0.0
         var = float(np.var(g)) if g.size else 0.0
-        heuristic = var / ((C**2) * (mu**2 + 1e-12))
+        heuristic = var / ((float(cfg.adaptive_C) ** 2) * (mu**2 + 1e-12))
 
-        if adaptive and (heuristic > D0):
-            cfg.batch_size = min(int(cfg.batch_size * M), _bs_max_local)
+        if adaptive and (heuristic > float(cfg.adaptive_D0)):
+            cfg.batch_size = min(int(cfg.batch_size * float(cfg.adaptive_M)), _bs_max_local)
 
-        if (ep % cfg.log_every) == 0:
-            print(
-                f"epoch {ep:04d} | "
-                f"total={sum_total/n:.2e} | hjb={sum_hjb/n:.2e} | dpc={sum_dpc/n:.2e} | sup={sum_sup/n:.2e} | "
-                f"bs={int(cfg.batch_size)} | heur={heuristic:.2e}"
-            )
+        # NEW: Compute validation MSE
+        val_mse = None
+        if val_loader is not None:
+            model.eval()
+            val_mse_sum = 0.0
+            val_n = 0
+            with torch.no_grad():
+                for batch in val_loader:
+                    batch = tuple(b.to(cfg.device) for b in batch)
+                    if len(batch) >= 2 and batch[1] is not None:
+                        X_val, G_val = batch[0], batch[1]
+                        pred = model(X_val)
+                        mse = nn.functional.mse_loss(pred, G_val, reduction='sum')
+                        val_mse_sum += float(mse.item())
+                        val_n += X_val.shape[0]
+            if val_n > 0:
+                val_mse = val_mse_sum / val_n
+                val_mses.append(val_mse)
+            model.train()
 
-    history = {"iters": np.asarray(iters), "loss": np.asarray(losses)}
+
+            if (ep % cfg.log_every) == 0:
+                bs_disp = "None" if cfg.batch_size is None else str(int(cfg.batch_size))
+                val_str = f" | val_mse={val_mse:.2e}" if val_mse is not None else " | val_mse=nan"
+                print(f"epoch {ep:04d} | loss={sum_total/n:.2e} | hjb={sum_hjb/n:.2e} | sup={sum_sup/n:.2e} | bs={bs_disp} | heur=nan{val_str}")
+
+    history = {"iters": np.asarray(iters), "loss": np.asarray(losses), "phase": np.asarray(phases)}
+    if val_mses:
+        history["val_mse"] = np.asarray(val_mses)
     return model, history
 
 
@@ -410,46 +400,102 @@ def hjb_parts(model, X: torch.Tensor):
     
     return dVdX, u, f, L
 
+def normalize_lambdas(lambda_hjb: float, lambda_sup: float):
+    """
+    Normalize lambdas so they sum to 1.0.
+    If lambda_hjb = 0, then lambda_sup = 1.0.
+    Otherwise: lambda_hjb_norm = lambda_hjb / (lambda_hjb + lambda_sup)
+               lambda_sup_norm = lambda_sup / (lambda_hjb + lambda_sup)
+    """
+    total = lambda_hjb + lambda_sup
+    if total == 0.0:
+        return 0.0, 0.0
+    if lambda_hjb == 0.0:
+        return 0.0, 1.0
+    return lambda_hjb / total, lambda_sup / total
+
 def loss_unified(
     model,
     batch,
     *,
-    mode: str,                    # "supervised" | "unsupervised"
-    supervision: bool,            # selects which term(s) are active
-    lambda_hjb: float = 1e-6,
-    lambda_dpc: float = 1e-3,
-    lambda_sup: float = 3e-3,
-    horizon: int = 30,
-    dt: float = 0.3,
+    mode: str,
+    supervision: bool,
+    lambda_hjb: float = 1.0,
+    lambda_dpc: float = 0.0,  # Not used anymore
+    lambda_sup: float = 0.0,  # Supervised penalty weight (normalized to sum with lambda_hjb to 1.0)
+    sup_err_scale: float = 1.0,  # Scale factor for supervised MSE to match HJB magnitude
+    horizon: int = None,
+    dt: float = 0.001,
 ):
     X = batch[0]
     zero = X.new_tensor(0.0)
 
     hjb_err = zero
-    dpc_err = zero
+    dpc_err = zero  # Always zero (DPC cost removed)
     sup_err = zero
 
-    if (mode == "unsupervised") and (not supervision):
-        # --- HJB residual ---
-        dVdX, _, f, L = hjb_parts(model, X)
-        H = L + (dVdX * f).sum(dim=1)
-        hjb_err = (H ** 2).mean()
+    # Compute HJB error everywhere (supervised and unsupervised)
+    dVdX, _, f, L = hjb_parts(model, X)
+    H = L + (dVdX * f).sum(dim=1)
+    hjb_err = (H ** 2).mean()
 
-        # --- DPC rollout ---
+    # Compute supervised MSE error if we have ground truth gradients
+    # Note: sup_err is returned unscaled; scaling is applied via lambda_sup in loss computation
+    if (len(batch) >= 2) and (batch[1] is not None):
+        G = batch[1]
+        pred = model(X)
+        sup_err = nn.functional.mse_loss(pred, G)
+
+    # Compute HJB error along rollout (unsupervised mode only, no supervision)
+    # Compute HJB error along rollout (unsupervised mode only, no supervision)
+    if (mode == "unsupervised") and (not supervision) and (horizon is not None):
         x = X
-        total_cost = X.new_zeros(X.shape[0])
-        for _ in range(horizon):
-            _, _, f, L = hjb_parts(model, x)
-            total_cost = total_cost + L * dt
-            x = torch.clamp(x + f * dt, -1.5, 1.5)
-        dpc_err = total_cost.mean()
+        hjb_rollout_err = X.new_zeros(X.shape[0])
+        converged = X.new_zeros(X.shape[0], dtype=torch.bool)
 
-    else:
-        # supervised term only
-        if (len(batch) >= 2) and (batch[1] is not None):
-            G = batch[1]
-            pred = model(X)
-            sup_err = nn.functional.mse_loss(pred, G)
+        # Get target state X_bar
+        X_bar = torch.tensor(model.config.ocp.X_bar, dtype=X.dtype, device=X.device).T
+        if X_bar.ndim == 1:
+            X_bar = X_bar.unsqueeze(0)
 
-    total = (lambda_hjb * hjb_err) + (lambda_dpc * dpc_err) + (lambda_sup * sup_err)
+        # dt parameters: small when far, large when close
+        dt_min = 0.00001
+        dt_max = 0.1 
+        convergence_threshold = 0.0005 # burgers: 0.0005, allen_cahn: ?
+
+        for step in range(horizon):
+            # Compute distance to target X_bar
+            x_err = x - X_bar
+            x_dist = torch.norm(x_err, dim=1)
+            
+            # Check convergence
+            newly_converged = (x_dist < convergence_threshold) & (~converged)
+            converged = converged | newly_converged
+            
+            if converged.all():
+                break
+            
+            # Adaptive dt based on distance to target
+            max_dist = 2.0
+            normalized_dist = torch.clamp(x_dist / max_dist, 0.0, 1.0)
+            current_dt = dt_min * (dt_max / dt_min) ** (1.0 - normalized_dist)
+            
+            # Compute HJB error at this rollout step
+            dVdX, _, f, L = hjb_parts(model, x)
+            H = L + (dVdX * f).sum(dim=1)
+            
+            # Accumulate HJB error (only for non-converged trajectories)
+            active_mask = ~converged
+            hjb_rollout_err[active_mask] = hjb_rollout_err[active_mask] + (H[active_mask] ** 2) * current_dt
+            
+            # Update state
+            x = x + f * current_dt
+
+        # Add HJB error from rollout to initial HJB error
+        actual_steps = step + 1 if step < horizon else horizon
+        if actual_steps > 0:
+            hjb_err = hjb_err + hjb_rollout_err.mean() / actual_steps
+
+    # Scale supervised error to match HJB magnitude
+    total = (lambda_hjb * hjb_err) + (lambda_dpc * dpc_err) + (lambda_sup * sup_err_scale * sup_err)
     return total, hjb_err, dpc_err, sup_err

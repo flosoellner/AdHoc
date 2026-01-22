@@ -1,8 +1,18 @@
 import numpy as np
+import warnings
+
+# Suppress RuntimeWarnings for overflow/invalid value operations
+warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*overflow.*')
+warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*invalid value.*')
+
+# Suppress NumPy warnings at the NumPy level (more reliable)
+np.seterr(over='ignore', invalid='ignore')
+
 try:
     from scipy.integrate import cumtrapz
 except:
     from scipy.integrate import cumulative_trapezoid as cumtrapz
+
 from scipy.optimize._numdiff import approx_derivative
 from scipy import sparse
 
@@ -221,26 +231,36 @@ class BaseOCP:
         params_dict['w'] = self.w
         return params_dict
 
+    # In the norm() function, add validation:
     def norm(self, X, center_X_bar=True):
-        '''
-        Calculate the distance of a batch of spatial points from X_bar or zero.
-        Uses the Clenshaw Curtis quadrature weights to compute a weighted norm.
-
-        Arguments
-        ----------
-        X : (n_states, n_data) array
-            Points to compute distances for
-        center_X_bar : not used
-            For API consistency only
-
-        Returns
-        ----------
-        X_norm : (n_data,) array
-            Norm for each point in X
-        '''
         X = X.reshape(self.n_states, -1)
-
-        return np.sqrt(np.sum(X**2 * self.w, axis=0))
+        
+        # Legacy code (always computed distance from zero):
+        # return np.sqrt(np.sum(X**2 * self.w, axis=0))
+        
+        # New code: compute distance from X_bar when center_X_bar=True
+        if center_X_bar:
+            # Validate X_bar exists and has correct shape
+            if not hasattr(self, 'X_bar') or self.X_bar is None:
+                # Fallback to distance from zero
+                return np.sqrt(np.sum(X**2 * self.w, axis=0))
+            
+            X_bar = self.X_bar.reshape(self.n_states, -1)
+            if X_bar.shape[0] != self.n_states:
+                raise ValueError(f"X_bar shape mismatch: {X_bar.shape} vs n_states={self.n_states}")
+            
+            X_err = X - X_bar
+            result = np.sqrt(np.sum(X_err**2 * self.w, axis=0))
+            
+            # Validate result
+            if not np.isfinite(result).all():
+                # Fallback to distance from zero if computation failed
+                return np.sqrt(np.sum(X**2 * self.w, axis=0))
+            
+            return result
+        else:
+            # For backward compatibility, allow computing distance from zero
+            return np.sqrt(np.sum(X**2 * self.w, axis=0))
 
 
     def running_cost(self, X, U, wX=None):

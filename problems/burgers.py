@@ -1,5 +1,13 @@
 import numpy as np
 import torch
+import warnings
+
+# Suppress RuntimeWarnings for overflow/invalid value operations
+warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*overflow.*')
+warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*invalid value.*')
+
+# Suppress NumPy warnings at the NumPy level (more reliable)
+np.seterr(over='ignore', invalid='ignore')
 
 from .base import BaseOCP, cheb
 from controls.lqr import LQR
@@ -12,7 +20,7 @@ class BurgersOCP(BaseOCP):
         n_states = config.n_states
         n_controls = config.n_controls
         # Burgers-specific parameters
-        self.nu = 0.01
+        self.nu = 0.012 # 0.01= hard, 0.02=easy
         self.gamma = 0.1
         self.R = 0.5
         kappa = 25.
@@ -215,12 +223,18 @@ class BurgersOCP(BaseOCP):
         X = X.reshape(self.n_states, -1)
         U = U.reshape(self.n_controls, -1)
 
-        dXdt = (
-            -0.5 * (self.D @ X**2)
-            + (self.nu * self.D2) @ X
-            + X * self.alpha * np.exp(-self.gamma * X)
-            + self.B @ U
-        )
+        # Suppress warnings for this computation
+        with np.errstate(over='ignore', invalid='ignore'):
+            exp_term = np.exp(-self.gamma * X)
+            # Clip exp_term to prevent overflow in multiplication
+            exp_term = np.clip(exp_term, 0, 1e100)
+            
+            dXdt = (
+                -0.5 * (self.D @ X**2)
+                + (self.nu * self.D2) @ X
+                + X * self.alpha * exp_term
+                + self.B @ U
+            )
         return dXdt.flatten() if flat_out else dXdt
 
     def torch_dynamics(self, x, u):

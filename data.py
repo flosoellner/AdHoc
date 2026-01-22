@@ -3,7 +3,7 @@ import warnings
 import numpy as np
 from scipy.interpolate import interp1d
 import sampling
-from tables import save_keyval_table_tex_2row
+
 
 import simulation
 
@@ -72,7 +72,48 @@ def generate(
     def open_converged(X, U):
         return OCP.running_cost(X, U) < config.fp_tol
 
-    X0_pool = sampling.sample_conditions(config, n_trajectories, seed=config.seed).reshape(OCP.n_states, -1)
+    # Use adaptive sampling with LQR controller to generate initial conditions
+    # If controller is None, use LQR; otherwise use the provided controller
+    sampling_controller = OCP.LQR
+    X0_pool, _ = sampling.adaptive_sample_conditions(
+        config, n_trajectories, 
+        controller=sampling_controller,
+        n_candidates=5,  # or adjust as needed
+        seed=config.seed
+    )
+    # adaptive_sample_conditions returns (d, n), so reshape if needed
+    if X0_pool.shape[0] != OCP.n_states:
+        X0_pool = X0_pool.T  # Ensure (n_states, n_trajectories)
+    
+    # Validate X0_pool - filter out any non-finite values
+    valid_mask = np.isfinite(X0_pool).all(axis=0)
+    if not valid_mask.all():
+        n_invalid = np.sum(~valid_mask)
+        print(f"Warning: {n_invalid} non-finite initial conditions detected, filtering them out.")
+        X0_pool = X0_pool[:, valid_mask]
+        # If we lost too many, resample to get enough
+        if X0_pool.shape[1] < n_trajectories:
+            n_needed = n_trajectories - X0_pool.shape[1]
+            X0_additional, _ = sampling.adaptive_sample_conditions(
+                config, n_needed,
+                controller=sampling_controller,
+                n_candidates=5,
+                seed=None  # Don't reset seed, continue from current state
+            )
+            if X0_additional.shape[0] != OCP.n_states:
+                X0_additional = X0_additional.T
+            # Filter additional samples too
+            valid_additional = np.isfinite(X0_additional).all(axis=0)
+            X0_additional = X0_additional[:, valid_additional]
+            if X0_additional.shape[1] > 0:
+                X0_pool = np.hstack([X0_pool, X0_additional])
+            # If still not enough, pad with simple samples
+            if X0_pool.shape[1] < n_trajectories:
+                n_still_needed = n_trajectories - X0_pool.shape[1]
+                X0_simple = sampling.sample_conditions(config, n_still_needed, seed=None)
+                if X0_simple.shape[0] != OCP.n_states:
+                    X0_simple = X0_simple.T
+                X0_pool = np.hstack([X0_pool, X0_simple[:, :n_still_needed]])
 
     n_attempt = 0
     n_sol = 0
@@ -100,7 +141,61 @@ def generate(
         row = '{att:^' + w + 'd}|{sol:^' + w + 'd}|{des:^' + w + 'd}'
 
         while n_track() < n_trajectories:
-            X0 = X0_pool[:, n_track()]
+            # Ensure we have enough samples in the pool
+            if n_track() >= X0_pool.shape[1]:
+                # Need more samples - resample
+                n_needed = n_trajectories - n_track()
+                X0_additional, _ = sampling.adaptive_sample_conditions(
+                    config, n_needed,
+                    controller=sampling_controller,
+                    n_candidates=5,
+                    seed=None
+                )
+                if X0_additional.shape[0] != OCP.n_states:
+                    X0_additional = X0_additional.T
+                # Filter non-finite values
+                valid_additional = np.isfinite(X0_additional).all(axis=0)
+                X0_additional = X0_additional[:, valid_additional]
+                if X0_additional.shape[1] > 0:
+                    X0_pool = np.hstack([X0_pool, X0_additional])
+            
+            X0 = X0_pool[:, n_track()].flatten()
+            
+            # Validate X0 before using it
+            if not np.isfinite(X0).all():
+                # Skip this invalid initial condition and resample
+                if resolve_failed:
+                    # Try to get a valid sample
+                    max_resample_attempts = 10
+                    X0_new = None
+                    for _ in range(max_resample_attempts):
+                        X0_candidate = sampling.sample_conditions(config, 1, seed=None)
+                        if X0_candidate.shape[0] != OCP.n_states:
+                            X0_candidate = X0_candidate.T
+                        if np.isfinite(X0_candidate).all():
+                            X0_new = X0_candidate.flatten()
+                            break
+                    
+                    if X0_new is not None:
+                        # Replace in pool and use the new X0
+                        if n_track() < X0_pool.shape[1]:
+                            X0_pool[:, n_track()] = X0_new
+                        else:
+                            X0_pool = np.hstack([X0_pool, X0_new.reshape(-1, 1)])
+                        X0 = X0_new
+                        # Continue with the resampled X0 (don't skip)
+                    else:
+                        # Still invalid after max attempts, skip this attempt
+                        n_attempt += 1
+                        n_fail += 1
+                        fail_time.append(0.0)
+                        continue
+                else:
+                    # Not resolving failed, just skip
+                    n_attempt += 1
+                    n_fail += 1
+                    fail_time.append(0.0)
+                    continue
 
             n_attempt += 1
 
@@ -113,9 +208,18 @@ def generate(
                     config, events=events
                 )
 
+                # Validate simulation results
+                if not np.isfinite(X).all() or X.shape[1] == 0:
+                    # Simulation produced invalid results, treat as failure
+                    warnings.warn(UserWarning())
+                    raise RuntimeWarning("Simulation produced non-finite values")
+
                 if ode_converged:
                     V, dVdX, U = controller.bvp_guess(X)
                 else:
+                    # Warm start failed - this is a failure, but we can still try to solve OCP
+                    # with the interpolated guess. However, we should note this as a failure
+                    # if the OCP also fails to converge.
                     # Use linear interpolation if the warm start controller failed
                     # to stabilize the system
                     t = np.linspace(
@@ -127,6 +231,7 @@ def generate(
                     V = np.zeros_like(t)
                     dVdX = np.zeros_like(X)
                     U = np.tile(OCP.U_bar, (1,X.shape[1]))
+                    # Note: ode_converged=False, but we'll continue to try OCP solve
 
                 # Solves the two-point BVP until to convergence to infinite
                 # horizon approximation
@@ -158,17 +263,39 @@ def generate(
                             data[key] = []
                         data[key].append(np.atleast_2d(new_data)[:,:keep_idx+1])
                 else:
+                    # OCP failed to converge - count as failure
                     warnings.warn(UserWarning())
+                    raise RuntimeWarning("OCP failed to converge")
 
-            except (UserWarning, RuntimeWarning):
+            except (UserWarning, RuntimeWarning, ValueError) as e:
                 fail_time.append(time.time() - start_time)
 
                 n_fail += 1
+                
+                # Debug: print failure reason if verbose
+                if verbose > 0:
+                    print(f"\nFailure reason: {type(e).__name__}: {str(e)}")
 
                 # Resample the failed initial condition
                 if resolve_failed:
-                    X0_new = sampling.sample_conditions(config, 1, seed=None)
-                    X0_pool[:,n_sol] = X0_new.T  # or X0_new.T if needed
+                    # Try to get a valid sample
+                    max_resample_attempts = 10
+                    X0_new = None
+                    for _ in range(max_resample_attempts):
+                        X0_candidate = sampling.sample_conditions(config, 1, seed=None)
+                        if X0_candidate.shape[0] != OCP.n_states:
+                            X0_candidate = X0_candidate.T
+                        if np.isfinite(X0_candidate).all():
+                            X0_new = X0_candidate.flatten()
+                            break
+                    
+                    if X0_new is not None:
+                        # Replace in pool at the current position
+                        if n_sol < X0_pool.shape[1]:
+                            X0_pool[:, n_sol] = X0_new
+                        else:
+                            # Need to extend pool
+                            X0_pool = np.hstack([X0_pool, X0_new.reshape(-1, 1)])
 
             if verbose:
                 for header in _headers:
@@ -217,25 +344,68 @@ def _fingerprint(config, n_trajectories, controller):
     return hashlib.sha1(s).hexdigest(), payload
 
 
-def load_or_generate(config, n_trajectories, *, controller=None, cache_dir=None, force_regen=False, **kwargs):
+
+
+def load_or_generate(config, n_trajectories, *, controller=None, cache_dir=None, force_regen=False, val_split=0.2, **kwargs):
     if cache_dir is None:
         cache_dir = f"./cache_seed{config.seed}/data"
     os.makedirs(cache_dir, exist_ok=True)
 
     key, meta = _fingerprint(config, n_trajectories, controller)
-    path = os.path.join(cache_dir, f"pmp_{key}.npz")
+    path_train = os.path.join(cache_dir, f"pmp_{key}_train.npz")
+    path_val = os.path.join(cache_dir, f"pmp_{key}_val.npz")
 
-    if (not force_regen) and os.path.exists(path):
-        z = np.load(path, allow_pickle=True)
-        dataset = {k: z[k] for k in z.files if k != "__meta__"}
-        meta_loaded = json.loads(str(z["__meta__"]))
-        return dataset, meta_loaded
+    if (not force_regen) and os.path.exists(path_train) and os.path.exists(path_val):
+        # Load both train and validation sets
+        z_train = np.load(path_train, allow_pickle=True)
+        z_val = np.load(path_val, allow_pickle=True)
+        dataset_train = {k: z_train[k] for k in z_train.files if k != "__meta__"}
+        dataset_val = {k: z_val[k] for k in z_val.files if k != "__meta__"}
+        meta_loaded = json.loads(str(z_train["__meta__"]))
+        return dataset_train, dataset_val, meta_loaded
 
+    # Generate data
     dataset, n_attempt, n_fail, sol_time, fail_time = generate(
         config.ocp, config, n_trajectories,
         controller=controller,
         **kwargs
     )
+
+    # Split into train and validation sets
+    n_data = dataset['X'].shape[1] if 'X' in dataset else dataset.get('t', np.array([])).shape[0]
+    if n_data == 0:
+        raise ValueError("Generated dataset is empty")
+    
+    # Create random permutation for splitting
+    np.random.seed(config.seed)
+    indices = np.random.permutation(n_data)
+    n_val = int(n_data * val_split)
+    val_indices = indices[:n_val]
+    train_indices = indices[n_val:]
+    
+    # Split the data
+    dataset_train = {}
+    dataset_val = {}
+    for key, val in dataset.items():
+        if key == 'n_trajectories':
+            # Keep original count for metadata, but we'll update it
+            dataset_train[key] = val
+            dataset_val[key] = val
+        elif isinstance(val, np.ndarray):
+            if val.ndim == 1:
+                dataset_train[key] = val[train_indices]
+                dataset_val[key] = val[val_indices]
+            elif val.ndim == 2:
+                dataset_train[key] = val[:, train_indices]
+                dataset_val[key] = val[:, val_indices]
+            else:
+                # For higher dimensional arrays, assume last dimension is the data dimension
+                dataset_train[key] = val[..., train_indices]
+                dataset_val[key] = val[..., val_indices]
+        else:
+            # For non-array data, copy to both
+            dataset_train[key] = val
+            dataset_val[key] = val
 
     meta_out = dict(
         **meta,
@@ -243,8 +413,13 @@ def load_or_generate(config, n_trajectories, *, controller=None, cache_dir=None,
         n_fail=int(n_fail),
         sol_time=float(sol_time),
         fail_time=float(fail_time),
+        n_train=int(len(train_indices)),
+        n_val=int(len(val_indices)),
+        val_split=float(val_split),
     )
 
-    np.savez_compressed(path, **dataset, __meta__=json.dumps(meta_out))
-    return dataset, meta_out
-
+    # Save both train and validation sets
+    np.savez_compressed(path_train, **dataset_train, __meta__=json.dumps(meta_out))
+    np.savez_compressed(path_val, **dataset_val, __meta__=json.dumps(meta_out))
+    
+    return dataset_train, dataset_val, meta_out

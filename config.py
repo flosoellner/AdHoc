@@ -1,13 +1,13 @@
-system = 'allen_cahn' # 'burgers', 'allen_cahn'
+system = 'burgers' # 'burgers', 'allen_cahn'
 
 # Problem dimensions
-n_states = 32
-n_controls = 3 # burgers: 2, allen_cahn: 3
+n_states = 32 # burgers: 32, allen_cahn: 48
+n_controls = 2 # burgers: 2, allen_cahn: 3
 
 # Time horizon parameters
-t1_initial = 30.0
-t1_scale = 6/5
-t1_max = 150.0
+t1_initial = 30.0 # burgers: 30.0, allen_cahn: 6.0
+t1_scale = 6/5 
+t1_max = 150.0 # burgers: 150.0, allen_cahn: 30.0
 
 
 
@@ -17,8 +17,7 @@ t1_max = 150.0
 
 
 # Seed
-seed = 4
-
+seed = 8
 
 def create_config(**overrides):
     """
@@ -38,14 +37,14 @@ def create_config(**overrides):
     import numpy as np
 
     config = SimpleNamespace(
-        seed=seed,
+        seed=seed, 
         n_states=n_states,
         n_controls=n_controls,
         t1_initial=t1_initial,
         t1_scale=t1_scale,
         t1_max=t1_max,
         system=system,
-        fp_tol=5e-03
+        fp_tol=5e-04 # old 5e-03 # burgers: 5e-04, allen_cahn: ?
     )
 
     # Apply overrides (e.g. create_config(T_initial=30.0))
