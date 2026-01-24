@@ -30,27 +30,31 @@ def _infer_system(config=None) -> str | None:
 
 def _with_system_figures_subdir(savepath, config=None):
     """
-    If savepath is under figures/, automatically write into figures/<system>/...
+    If savepath is under figures/ or thesis/figures/, automatically write into 
+    results/{system}/seed_{seed}/thesis/figures/...
 
     Examples:
-      figures/foo.pdf -> figures/allen_cahn/foo.pdf
-      figures/allen_cahn/foo.pdf -> unchanged
+      figures/foo.pdf -> results/allen_cahn/seed_7/thesis/figures/foo.pdf
+      thesis/figures/foo.pdf -> results/allen_cahn/seed_7/thesis/figures/foo.pdf
     """
     if savepath is None:
         return None
     p = Path(savepath)
     if p.is_absolute():
         return p
-
-    system = _infer_system(config)
-    if not system:
-        return p
-
-    parts = p.parts
-    if len(parts) >= 1 and parts[0] == "figures":
-        if len(parts) >= 2 and parts[1] == system:
-            return p
-        return Path("figures") / system / Path(*parts[1:])
+    
+    # If config is provided, use new results directory structure
+    if config and hasattr(config, "system") and hasattr(config, "seed"):
+        from config import get_results_dir
+        # Check if path starts with figures/ or thesis/figures/
+        if str(p).startswith("figures/") or str(p).startswith("thesis/figures/"):
+            # Extract filename
+            filename = p.name
+            # Use new structure
+            new_path = get_results_dir(config, "thesis/figures")
+            return str(Path(new_path) / filename)
+    
+    # If no config or path doesn't match, return as-is
     return p
 
 
@@ -166,107 +170,6 @@ def _value_from_controller_or_gradnet(controller, X, *, device="cpu", n_quad=64)
 
     raise ValueError("Controller must provide eval_V(X) or have .grad_net for reconstruction.")
 
-
-def plot_value_slice(
-    *,
-    config,
-    controllers,                 # list like [("LQR", config.ocp.LQR), ("ctrl1", ctrl1)]
-    i=None,                      # basis slice x = s e_i
-    v=None,                      # direction slice x = s v (overrides i)
-    smax=2.0,
-    ns=101,
-    n_quad=64,
-    device="cpu",
-    # bundle-of-slices visualization (optional)
-    n_slices: int = 50,
-    slice_sigma: float = 0.0,    # std-dev of additive offset in state units
-    slice_seed: int = 0,
-    band_alpha: float = 0.08,    # alpha for individual slices (when n_slices>1)
-    show_mean: bool = True,      # overlay mean curve (when n_slices>1)
-    title=None,
-    figsize=(6.2, 3.2),
-    savepath=None,
-):
-    """
-    Plots s -> V(x(s)) for multiple controllers on a 1D slice through R^d.
-    Slice options:
-      - basis slice: set i (int): x = s e_i
-      - direction slice: set v (d,) : x = s v
-    """
-    d = int(config.n_states)
-    s = np.linspace(-float(smax), float(smax), int(ns))
-
-    if v is not None:
-        v = np.asarray(v).reshape(-1)
-        if v.size != d:
-            raise ValueError(f"v must have shape ({d},)")
-        v = v / (np.linalg.norm(v) + 1e-12)
-        X0 = v[:, None] * s[None, :]          # (d,ns)
-        xlabel = r"$s$ in $x=s\,v$"
-    else:
-        if i is None:
-            i = d // 2
-        i = int(i)
-        if not (0 <= i < d):
-            raise ValueError(f"i must be in [0,{d-1}]")
-        X0 = np.zeros((d, s.size))
-        X0[i, :] = s
-        xlabel = rf"$x_{{{i}}}$ (slice; other components $0$)"
-
-    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
-    for k, (name, ctrl) in enumerate(_iter_named_controllers(controllers)):
-        # Create a "bundle" of nearby slices x(s) = x0(s) + offset to form a thick curve.
-        nslices = int(max(1, n_slices))
-        sigma = float(slice_sigma)
-
-        if (nslices <= 1) or (sigma <= 0.0):
-            V = _value_from_controller_or_gradnet(ctrl, X0, device=device, n_quad=n_quad)
-            ax.plot(s, V, label=str(name))
-            continue
-
-        rng = np.random.default_rng(int(slice_seed) + int(k))
-        Vs = []
-
-        # Put a single "center" slice into the bundle
-        V_center = _value_from_controller_or_gradnet(ctrl, X0, device=device, n_quad=n_quad)
-        Vs.append(np.asarray(V_center).reshape(-1))
-
-        # Draw additional offset slices with low alpha.
-        for _j in range(nslices - 1):
-            off = rng.normal(size=d)
-
-            if v is not None:
-                # project offset orthogonal to v so we keep the same direction slice
-                off = off - v * float(np.dot(v, off))
-            else:
-                # keep the coordinate slice direction: don't perturb along e_i
-                off[i] = 0.0
-
-            off = sigma * off
-            X = X0 + off[:, None]
-            Vj = _value_from_controller_or_gradnet(ctrl, X, device=device, n_quad=n_quad)
-            Vj = np.asarray(Vj).reshape(-1)
-            Vs.append(Vj)
-            ax.plot(s, Vj, alpha=float(band_alpha), lw=2.0)
-
-        if show_mean:
-            Vmean = np.mean(np.stack(Vs, axis=0), axis=0)
-            ax.plot(s, Vmean, lw=2.6, label=str(name))
-        else:
-            # Label only once (on the center curve) to avoid legend spam.
-            ax.plot(s, Vs[0], lw=2.6, label=str(name))
-
-
-
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(r"$V(x)$")
-    if title:
-        ax.set_title(title)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-
-    _save_fig(fig, _with_system_figures_subdir(savepath, config))
-    return fig
 
 
 def plot_value_vs_state_norm(

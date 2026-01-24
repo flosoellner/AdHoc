@@ -5,11 +5,9 @@ n_states = 32 # burgers: 32, allen_cahn: 48
 n_controls = 2 # burgers: 2, allen_cahn: 3
 
 # Time horizon parameters
-t1_initial = 30.0 # burgers: 30.0, allen_cahn: 6.0
+t1_initial = 15.0 # burgers: 30.0, allen_cahn: 6.0
 t1_scale = 6/5 
-t1_max = 150.0 # burgers: 150.0, allen_cahn: 30.0
-
-
+t1_max = 60.0 # burgers: 150.0, allen_cahn: 30.0
 
 
 
@@ -17,22 +15,10 @@ t1_max = 150.0 # burgers: 150.0, allen_cahn: 30.0
 
 
 # Seed
-seed = 8
+seed = 999
 
 def create_config(**overrides):
-    """
-    Create the central configuration object (attribute access everywhere).
-    
-    Parameters
-    ----------
-    **overrides : dict
-        Any parameters to override defaults
-        
-    Returns
-    -------
-    config : types.SimpleNamespace
-        Configuration object (supports `config.seed`, `config.n_states`, ...)
-    """
+    """Create configuration object with attribute access."""
     from types import SimpleNamespace
     import numpy as np
 
@@ -44,10 +30,9 @@ def create_config(**overrides):
         t1_scale=t1_scale,
         t1_max=t1_max,
         system=system,
-        fp_tol=5e-04 # old 5e-03 # burgers: 5e-04, allen_cahn: ?
+        fp_tol=1e-02
     )
 
-    # Apply overrides (e.g. create_config(T_initial=30.0))
     for k, v in overrides.items():
         setattr(config, k, v)
 
@@ -90,7 +75,6 @@ def create_config(**overrides):
     elif config.system == "allen_cahn":
         from problems.allen_cahn import AllenCahnOCP
 
-        # keep these consistent with burgers branch (solver params etc if needed)
         config.ocp_solver = "indirect"
         config.direct_n_init_nodes = 50
         config.indirect_tol = 1e-05
@@ -123,3 +107,12 @@ def create_config(**overrides):
         raise ValueError(f"Unknown system: {config.system}")
 
     return config
+
+
+def get_results_dir(config, subdir=None):
+    """Get results directory: results/{system}/seed_{seed}/{subdir}/"""
+    import os
+    base = os.path.join("results", config.system, f"seed_{config.seed}")
+    if subdir:
+        return os.path.join(base, subdir)
+    return base

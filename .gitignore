@@ -11,22 +11,20 @@ __pycache__/
 ## Jupyter
 .ipynb_checkpoints/
 
-## Local caches / generated data
+## Results directory (contains all generated outputs)
+results/
+
+## Old directories (to be removed)
 cache_*/
 cache_seed*/
 cache_seed*/**
 cache_hard_ics/
-
-## Trained models / checkpoints
 saved_models/
+figures/
+thesis/tables/
+thesis/figures/
+
+## Model checkpoints (also in results/)
 *.pt
 *.pth
-
-## Generated figures
-figures/
-*.pdf
-*.png
-
-## Thesis outputs (generated tables etc.)
-thesis/tables/
 

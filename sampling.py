@@ -37,11 +37,15 @@ def sample_conditions(config, n: int, dist: float = None, seed: int = None, K: i
 
     # Generate samples: X0 = sum_{k=1}^10 a_k * sin(k * pi * xi), a_k ~ U[-1/k, 1/k]
     X0 = np.zeros((d, n))
-
-    for k in range(1, K + 1):
-        # Use sine for Dirichlet BC (Burgers)
-        ak = (2.0 * np.random.rand(1, n) - 1.0) / float(k)
-        X0 += ak * np.sin(k * xi_pi).reshape(d, 1)
+    if config.system == "burgers":
+        for k in range(1, K + 1):
+            # Use sine for Dirichlet BC (Burgers)
+            ak = (2.0 * np.random.rand(1, n) - 1.0) / float(k)
+            X0 += ak * np.sin(k * xi_pi).reshape(d, 1)
+    elif config.system == "allen_cahn":
+        for k in range(1, K+1):
+            ak = (2*np.random.rand(1, n) - 1) / k
+            X0 += ak * np.cos(k * np.pi * xi).reshape(d,1)
     
     # Normalize to dist if requested
     # Note: norm_func now computes distance from X_bar by default (was distance from zero)
@@ -57,18 +61,20 @@ def sample_conditions(config, n: int, dist: float = None, seed: int = None, K: i
     # Return as (n, d)
     return X0
 
+
+
 def adaptive_sample_conditions(
     config,
     n: int,
     *,
     controller,
-    n_candidates: int = 5,
+    n_candidates: int = 200,
     dist: float | None = None,
     seed: int | None = None,
     device: str = "cpu",
 ):
     """
-    Sample `n_candidates` using `sample_conditions`, score by ||dVdX||, return top-n.
+    Sample `n_candidates` using `sample_conditions`, score by ||dVdX - dVdX_LQR|| (residual), return top-n.
 
     controller can be:
     - LQR: has .eval_dVdX(X) with X shaped (d,N) numpy
@@ -92,7 +98,10 @@ def adaptive_sample_conditions(
     else:
         raise TypeError("controller must have eval_dVdX (LQR) or grad_net (NN Control).")
 
-    scores = np.linalg.norm(G, axis=0)
+    # Get LQR gradient and compute residual
+    G_lqr = config.ocp.LQR.eval_dVdX(Xcand)  # (d,N)
+    residual = G - G_lqr  # (d,N)
+    scores = np.linalg.norm(residual, axis=0)
     
     # Filter out non-finite values
     valid_mask = np.isfinite(scores) & np.isfinite(Xcand).all(axis=0)

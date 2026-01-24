@@ -223,18 +223,12 @@ class BurgersOCP(BaseOCP):
         X = X.reshape(self.n_states, -1)
         U = U.reshape(self.n_controls, -1)
 
-        # Suppress warnings for this computation
-        with np.errstate(over='ignore', invalid='ignore'):
-            exp_term = np.exp(-self.gamma * X)
-            # Clip exp_term to prevent overflow in multiplication
-            exp_term = np.clip(exp_term, 0, 1e100)
-            
-            dXdt = (
-                -0.5 * (self.D @ X**2)
-                + (self.nu * self.D2) @ X
-                + X * self.alpha * exp_term
-                + self.B @ U
-            )
+        dXdt = (
+            -0.5 * (self.D @ X**2)
+            + (self.nu * self.D2) @ X
+            + X * self.alpha * np.exp(-self.gamma * X)
+            + self.B @ U
+        )
         return dXdt.flatten() if flat_out else dXdt
 
     def torch_dynamics(self, x, u):
@@ -260,7 +254,7 @@ class BurgersPhysics(torch.nn.Module):
 
     def get_control(self, dVdX: torch.Tensor) -> torch.Tensor:
         u = -(0.5 / self.R_val) * (dVdX @ self.B)
-        return torch.clamp(u, -0.5, 0.5)
+        return torch.clamp(u, -10.0, 10.0)
 
     def dynamics(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
         x_T = x.t()

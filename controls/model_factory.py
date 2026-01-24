@@ -4,22 +4,27 @@ import torch
 from types import SimpleNamespace
 from controls.nn import GradNet
 
-# ============================================================================
-# DEFAULT CONTROLLER CONFIGURATIONS
-# ============================================================================
 DEFAULT_CONTROLLER_CONFIGS = {
 
     "GradNet": {
-        "enabled": False, # >>LQR
+        "enabled": False,
         "kind": "gradnet",
         "use_lqr": False,
         "train_mode": "unsupervised",
         "adaptive": False,
         "supervision": None,
     },
+    "GradNet (sup)": {
+        "enabled": False,
+        "kind": "gradnet",
+        "use_lqr": False,
+        "train_mode": "unsupervised",
+        "adaptive": False,
+        "supervision": True,
+    },
 
     "GradQRNet": {
-        "enabled": True, # <<LQR
+        "enabled": False,
         "kind": "gradnet",
         "use_lqr": True,
         "train_mode": "unsupervised",
@@ -27,7 +32,7 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "supervision": None,
     },
     "GradQRNet (sup)": {
-        "enabled": True, # >>LQR
+        "enabled": False,
         "kind": "gradnet",
         "use_lqr": True,
         "train_mode": "unsupervised",
@@ -36,21 +41,37 @@ DEFAULT_CONTROLLER_CONFIGS = {
     },
 
     "Hybrid GradNet": {
-        "enabled": False, # >>LQR
+        "enabled": False,
         "kind": "gradnet",
         "use_lqr": False,
         "train_mode": "hybrid",
         "adaptive": False,
         "supervision": None,
     },
+    "Hybrid GradNet (sup)": {
+        "enabled": False,
+        "kind": "gradnet",
+        "use_lqr": False,
+        "train_mode": "hybrid",
+        "adaptive": False,
+        "supervision": True,
+    },
 
     "Hybrid GradQRNet": {
-        "enabled": True, # <LQR
+        "enabled": False,
         "kind": "gradnet",
         "use_lqr": True,
         "train_mode": "hybrid",
         "adaptive": False,
         "supervision": None,
+    },
+    "Hybrid GradQRNet (sup)": {
+        "enabled": True,
+        "kind": "gradnet",
+        "use_lqr": True,
+        "train_mode": "hybrid",
+        "adaptive": False,
+        "supervision": True,
     },
 
     "Ad. GradNet": {
@@ -61,27 +82,23 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "adaptive": True,
         "supervision": None,
     },
+    "Ad. GradNet (sup)": {
+        "enabled": False,
+        "kind": "gradnet",
+        "use_lqr": False,
+        "train_mode": "unsupervised",
+        "adaptive": True,
+        "supervision": True,
+    },
 
     "Ad. GradQRNet": {
-        "enabled": True,
+        "enabled": False,
         "kind": "gradnet",
         "use_lqr": True,
         "train_mode": "unsupervised",
         "adaptive": True,
         "supervision": None,
     },
-
-    "Hybrid GradQRNet (sup)": {
-        "enabled": True, # <LQR
-        "kind": "gradnet",
-        "use_lqr": True,
-        "train_mode": "hybrid",
-        "adaptive": False,
-        "supervision": True,
-    },
-
-
-
     "Ad. GradQRNet (sup)": {
         "enabled": True,
         "kind": "gradnet",
@@ -99,9 +116,17 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "adaptive": True,
         "supervision": None,
     },
+    "Ad. Hybrid GradNet (sup)": {
+        "enabled": False,
+        "kind": "gradnet",
+        "use_lqr": False,
+        "train_mode": "hybrid",
+        "adaptive": True,
+        "supervision": True,
+    },
 
     "Ad. Hybrid GradQRNet": {
-        "enabled": True,
+        "enabled": False,
         "kind": "gradnet",
         "use_lqr": True,
         "train_mode": "hybrid",
@@ -109,7 +134,7 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "supervision": None,
     },
     "Ad. Hybrid GradQRNet (sup)": {
-        "enabled": True,
+        "enabled": False,
         "kind": "gradnet",
         "use_lqr": True,
         "train_mode": "hybrid",
@@ -155,9 +180,6 @@ def load_gradnet(path, *, config, device="cpu"):
     sd = ckpt["grad_net"]
     sd = {k: v for k, v in sd.items() if not k.startswith("_physics.")}
 
-    # Backward compatibility:
-    # - older checkpoints: plain nn.Sequential MLP -> "net.0.*", "net.2.*", ...
-    # - current default: residual net -> "net.inp.*", "net.blocks.*", "net.out.*"
     has_sequential_style = any(k.startswith("net.0.") for k in sd.keys())
 
 
@@ -191,18 +213,20 @@ def train_or_load_gradnet(
     train_loader=None,
     val_loader=None,  # NEW: validation loader
     train_cfg,
-    ckpt_dir: str = "./saved_models",
+    ckpt_dir: str = None,
     force_retrain: bool = False,
     device: str = "cpu",
     data=None,
     val_data=None,  # NEW: validation data dict
 ):
-    # Import here to avoid circular dependency
     from controls.train import train_loop, loss_unified, make_loader_XG
+    from config import get_results_dir
     
-    # Normalize supervision: None -> False
     if supervision is None:
         supervision = False
+    
+    if ckpt_dir is None:
+        ckpt_dir = get_results_dir(config, "saved_models")
     
     os.makedirs(ckpt_dir, exist_ok=True)
     ckpt_path = os.path.join(
@@ -227,7 +251,6 @@ def train_or_load_gradnet(
     if val_loader_actual is None and val_data is not None:
         val_loader_actual = make_loader_XG(val_data, train_cfg, shuffle=False)
 
-    # before calling train_loop in unsupervised / hybrid-unsup:
     sup_loader = None
     if supervision:
         if data is None:

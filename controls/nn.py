@@ -32,7 +32,7 @@ class TorchWrapperMixin:
 
 
 class GradNet(nn.Module, TorchWrapperMixin):
-    def __init__(self, config, hidden=64, depth=2, act=nn.Tanh, use_lqr=True):
+    def __init__(self, config, hidden=256, depth=2, act=nn.Tanh, use_lqr=True):
         super().__init__()
         self.config = config
         self.use_lqr = use_lqr
@@ -49,8 +49,7 @@ class GradNet(nn.Module, TorchWrapperMixin):
 
     def forward(self, x):
         g_res = self.net(x)
-        # Legacy: g0 = self.net(x.new_zeros((1, x.shape[1])))  # Old: evaluated at zero
-        # New: evaluate at X_bar to ensure network output is zero at target (works for both Burgers X_bar=0 and Allen-Cahn X_bar=-1)
+        # Evaluate at X_bar to ensure network output is zero at target
         X_bar_torch = torch.tensor(self.config.ocp.X_bar, dtype=x.dtype, device=x.device).T
         if X_bar_torch.ndim == 1:
             X_bar_torch = X_bar_torch.unsqueeze(0)
@@ -70,20 +69,13 @@ class GradNet(nn.Module, TorchWrapperMixin):
 
 
 class Control(nn.Module, TorchWrapperMixin):
-    """
-    Uses analytic control from value gradient.
-    Optionally adds an LQR baseline and/or uses a residual value gradient.
-    """
+    """Control from value gradient, optionally with LQR baseline."""
     def __init__(self, config, value_net=None, grad_net=None, use_autograd=False):
         super().__init__()
         self.config = config
         self.value_net = value_net
         self.grad_net = grad_net
         self.use_autograd = use_autograd
-
-
-
-
     def forward(self, x):
         if self.grad_net is not None:
             g = self.grad_net(x)                 # (N,d) torch
@@ -106,10 +98,7 @@ class Control(nn.Module, TorchWrapperMixin):
         return self._to_numpy(U, single)
 
     def bvp_guess(self, X):
-        """Returns (V, dVdX, U) for BVP initial guess."""
-        # Use LQR for V (if available)
-        V, _, _ = self.config.ocp.LQR.bvp_guess(X)
-        
+        """Return (V, dVdX, U) for BVP initial guess."""
         # Use NN for dVdX and U
         x, single = self._to_tensor(X)
         with torch.no_grad():
@@ -118,19 +107,46 @@ class Control(nn.Module, TorchWrapperMixin):
         
         U = self.eval_U(X)  # already implemented
         
-        # Handle shapes
-        if X.ndim < 2:
-            V = V.flatten()[0] if not np.isscalar(V) else V
-            dVdX = dVdX.flatten()
-            U = U.flatten()
+        # Compute V: use LQR if grad_net uses LQR, otherwise compute from dVdX
+        if self.grad_net is not None and hasattr(self.grad_net, 'use_lqr') and not self.grad_net.use_lqr:
+            # Pure GradNet: compute V from dVdX by integration (trapezoidal rule)
+            X_bar = self.config.ocp.X_bar
+            X_bar_torch = torch.tensor(X_bar, dtype=x.dtype, device=x.device)
+            if X_bar_torch.ndim == 1:
+                X_bar_torch = X_bar_torch.unsqueeze(0)
+            with torch.no_grad():
+                dVdX_bar_torch = self.grad_net(X_bar_torch)  # (1, d) tensor
+            dVdX_bar = self._to_numpy(dVdX_bar_torch, single=True)  # (d,) - single point
+            
+            # Compute V using trapezoidal rule: V(X) ≈ 0.5 * (dVdX_bar + dVdX) · (X - X_bar)
+            if X.ndim < 2:
+                dVdX_bar = dVdX_bar.flatten()
+                dVdX_flat = dVdX.flatten()
+                X_flat = X.flatten()
+                X_err = X_flat - X_bar.flatten()
+                dVdX_avg = 0.5 * (dVdX_bar + dVdX_flat)
+                V = np.dot(dVdX_avg, X_err)
+            else:
+                dVdX_bar = dVdX_bar.reshape(-1, 1)
+                X_err = X - X_bar
+                dVdX_avg = 0.5 * (dVdX_bar + dVdX)
+                V = np.sum(dVdX_avg * X_err, axis=0)
+            if X.ndim < 2:
+                V = float(V) if not np.isscalar(V) else V
+                dVdX = dVdX.flatten()
+                U = U.flatten()
+        else:
+            V, _, _ = self.config.ocp.LQR.bvp_guess(X)
+            if X.ndim < 2:
+                V = V.flatten()[0] if not np.isscalar(V) else V
+                dVdX = dVdX.flatten()
+                U = U.flatten()
         
         return V, dVdX, U
 
 
 def make_controller(config, kind="lqr", *, grad_net=None, value_net=None):
-    """
-    Returns an object with .eval_U(X) usable by simulation/data generation.
-    """
+    """Return controller with .eval_U(X) for simulation/data generation."""
     kind = kind.lower()
 
     if kind == "lqr":

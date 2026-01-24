@@ -78,7 +78,7 @@ def generate(
     X0_pool, _ = sampling.adaptive_sample_conditions(
         config, n_trajectories, 
         controller=sampling_controller,
-        n_candidates=5,  # or adjust as needed
+        n_candidates=200,  # or adjust as needed
         seed=config.seed
     )
     # adaptive_sample_conditions returns (d, n), so reshape if needed
@@ -348,7 +348,8 @@ def _fingerprint(config, n_trajectories, controller):
 
 def load_or_generate(config, n_trajectories, *, controller=None, cache_dir=None, force_regen=False, val_split=0.2, **kwargs):
     if cache_dir is None:
-        cache_dir = f"./cache_seed{config.seed}/data"
+        from config import get_results_dir
+        cache_dir = get_results_dir(config, "data")
     os.makedirs(cache_dir, exist_ok=True)
 
     key, meta = _fingerprint(config, n_trajectories, controller)

@@ -14,35 +14,28 @@ class TrainConfig:
     sup_n_steps: int = None
     sup_lr: float = 1e-5 # 
     unsup_epochs: int = 5
-    unsup_n_steps: int = 30 
+    unsup_n_steps: int = 70 # burgers: 30, allen_cahn: 100
     unsup_lr: float = 5e-4 # 
     batch_size: int = None
     device: str = "cpu"
     log_every: int = 1
     grad_clip: float | None = None
-    # -------------------------
-    # Adaptive batch sizing (unsupervised/hybrid)
-    # -------------------------
+    # Adaptive batch sizing
     bs_max: int = 256
     adaptive_init_frac: float = 1.0           # initial batch = ceil(nominal * frac)
     adaptive_bs_max_factor: float = 1.0        # max batch = factor * initial batch (adaptive=True)
     adaptive_D0: float = 0.0              # threshold for heuristic
     adaptive_C: float = 0.0002                    # heuristic scaling
     adaptive_M: float = 1.3                  # batch growth multiplier
-    # -------------------------
-    # Horizon growth parameters
-    # -------------------------
-    horizon_initial: int = 250      # initial rollout horizon
+    # Horizon growth
+    horizon_initial: int = 30    # burgers: 250, allen_cahn: 25 # initial rollout horizon
     horizon_max: int = 4000                  # maximum horizon (never exceed)
     horizon_growth_factor: float = 1.00      # multiply horizon by this each epoch (1.0 = no growth)
-    # -------------------------
     # Loss weighting
-    # -------------------------
     lambda_sup_base: float = 0.5            # Base supervised penalty weight (decays to 0)
     sup_err_scale: float = 10.0             # Scale factor for supervised MSE to match HJB magnitude
 
 
-# Model factory functions moved to controls.model_factory
 from controls.model_factory import save_model, load_gradnet, train_or_load_gradnet
 
 
@@ -74,41 +67,7 @@ def make_loader_XG(dataset, cfg: TrainConfig, shuffle=True):
     return DataLoader(TensorDataset(X, G), batch_size=cfg.batch_size, shuffle=shuffle, drop_last=False)
 
 
-# -------------------------
-# Generic training loop
-# -------------------------
 
-
-def train_loop(
-    model,
-    loader,
-    loss_fn,
-    cfg: TrainConfig,
-    *,
-    optimizer=None,
-    mode: str = None,
-    config=None,
-    adaptive: bool = False,
-    supervision: bool | None = None,
-    sup_loader=None,
-    sup_every: int = 500,
-    val_loader=None,  # NEW: validation loader
-):
-    import numpy as np
-
-    model = model.to(cfg.device) if hasattr(model, "to") else model
-    if optimizer is None:
-        optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-
-    if mode not in {"supervised", "unsupervised"}:
-        raise ValueError("mode must be 'supervised' or 'unsupervised'")
-
-    iters, losses, step = [], [], 0
-    val_mses = []  # NEW: track validation MSE per epoch
-
-    # -------------------------
-    # supervised (EARLY RETURN)
-    # -------------------------
 def train_loop(
     model,
     loader,
@@ -121,7 +80,7 @@ def train_loop(
     adaptive: bool = False,
     supervision: bool | None = None,  # Add this parameter
     sup_loader=None,
-    sup_every: int = 2000,
+    sup_every: int = 50,
     val_loader=None,
 ):
     import numpy as np
@@ -141,7 +100,6 @@ def train_loop(
 
     iters, losses, phases, step = [], [], [], 0
     val_mses = []
-    # ... existing code ...
 
     if mode == "supervised":
         if loader is None:
@@ -188,7 +146,6 @@ def train_loop(
                 losses.append(float(loss.item()))
                 phases.append("sup")  # Mark all supervised iterations
 
-            # ... rest of existing code (validation, logging) ...
 
             # NEW: Compute validation MSE
             val_mse = None
@@ -220,9 +177,6 @@ def train_loop(
             history["val_mse"] = np.asarray(val_mses)
         return model, history
 
-    # -------------------------
-    # unsupervised
-    # -------------------------
     if config is None:
         raise ValueError("unsupervised mode requires `config`")
 
@@ -434,7 +388,6 @@ def loss_unified(
     dpc_err = zero  # Always zero (DPC cost removed)
     sup_err = zero
 
-    # Compute HJB error everywhere (supervised and unsupervised)
     dVdX, _, f, L = hjb_parts(model, X)
     H = L + (dVdX * f).sum(dim=1)
     hjb_err = (H ** 2).mean()
@@ -447,7 +400,6 @@ def loss_unified(
         sup_err = nn.functional.mse_loss(pred, G)
 
     # Compute HJB error along rollout (unsupervised mode only, no supervision)
-    # Compute HJB error along rollout (unsupervised mode only, no supervision)
     if (mode == "unsupervised") and (not supervision) and (horizon is not None):
         x = X
         hjb_rollout_err = X.new_zeros(X.shape[0])
@@ -459,9 +411,9 @@ def loss_unified(
             X_bar = X_bar.unsqueeze(0)
 
         # dt parameters: small when far, large when close
-        dt_min = 0.00001
-        dt_max = 0.1 
-        convergence_threshold = 0.0005 # burgers: 0.0005, allen_cahn: ?
+        dt_min = 0.00000001
+        dt_max = 0.4 # burgers: 0.1, allen_cahn: 0.05
+        convergence_threshold = 0.01 # burgers: 0.0005, allen_cahn: ?
 
         for step in range(horizon):
             # Compute distance to target X_bar
@@ -476,26 +428,35 @@ def loss_unified(
                 break
             
             # Adaptive dt based on distance to target
+            # Adaptive dt based on distance to target
             max_dist = 2.0
             normalized_dist = torch.clamp(x_dist / max_dist, 0.0, 1.0)
             current_dt = dt_min * (dt_max / dt_min) ** (1.0 - normalized_dist)
             
             # Compute HJB error at this rollout step
             dVdX, _, f, L = hjb_parts(model, x)
+            
+            # Ensure f has correct shape (B, n) - fix if it's transposed
+            if f.shape != x.shape:
+                if f.shape == x.shape[::-1]:  # If f is (n, B) instead of (B, n)
+                    f = f.t()
+                else:
+                    raise RuntimeError(f"Shape mismatch: x has shape {x.shape}, f has shape {f.shape}")
+            
             H = L + (dVdX * f).sum(dim=1)
             
             # Accumulate HJB error (only for non-converged trajectories)
             active_mask = ~converged
-            hjb_rollout_err[active_mask] = hjb_rollout_err[active_mask] + (H[active_mask] ** 2) * current_dt
+            hjb_rollout_err[active_mask] = hjb_rollout_err[active_mask] + (H[active_mask] ** 2) * current_dt[active_mask]
             
-            # Update state
-            x = x + f * current_dt
+            # Update state - reshape current_dt for proper broadcasting
+            current_dt_expanded = current_dt.unsqueeze(1)  # (B, 1) for broadcasting with (B, n)
+            x = x + f * current_dt_expanded
 
         # Add HJB error from rollout to initial HJB error
         actual_steps = step + 1 if step < horizon else horizon
         if actual_steps > 0:
             hjb_err = hjb_err + hjb_rollout_err.mean() / actual_steps
 
-    # Scale supervised error to match HJB magnitude
     total = (lambda_hjb * hjb_err) + (lambda_dpc * dpc_err) + (lambda_sup * sup_err_scale * sup_err)
     return total, hjb_err, dpc_err, sup_err

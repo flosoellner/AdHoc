@@ -487,6 +487,7 @@ def monte_carlo(
 
     # Set default n_MC
     n_MC = 100  # Default
+    dist_mc = None
 
     # Check if controller is a list of (name, controller) tuples
     if isinstance(controller, list):
@@ -494,7 +495,7 @@ def monte_carlo(
         if X0_pool is None:
 
             np.random.seed(random_seed)
-            X0_pool = sampling.sample_conditions(config, n_MC)
+            X0_pool = sampling.sample_conditions(config, n_MC, dist=dist_mc)
         
         # Evaluate each controller with the same X0_pool
         all_results = {}
@@ -514,7 +515,7 @@ def monte_carlo(
     # Set n_MC from X0_pool if provided, otherwise use default
     if X0_pool is None:
         np.random.seed(random_seed)
-        X0_pool = sampling.sample_conditions(config, n_MC)
+        X0_pool = sampling.sample_conditions(config, n_MC, dist=dist_mc)
         bad = ~np.isfinite(X0_pool)
         bad_cols = np.where(bad.any(axis=0))[0]
         bad_cols[:10], len(bad_cols)
