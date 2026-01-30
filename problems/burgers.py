@@ -1,40 +1,66 @@
 import numpy as np
-import torch
-import warnings
 
-# Suppress RuntimeWarnings for overflow/invalid value operations
-warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*overflow.*')
-warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*invalid value.*')
-
-# Suppress NumPy warnings at the NumPy level (more reliable)
-np.seterr(over='ignore', invalid='ignore')
-
-from .base import BaseOCP, cheb
+from .base import BaseOCP, _build_dirichlet_operators
 from controls.lqr import LQR
+
+
+def get_default_config():
+    """Burgers system-specific default config (n_states, n_controls, time, solver, etc.)."""
+    return {
+        "n_states": 32,
+        "n_controls": 2,
+        "t1_initial": 15.0,
+        "t1_scale": 6 / 5,
+        "t1_max": 60.0,
+        "ocp_solver": "indirect",
+        "direct_n_init_nodes": 50,
+        "indirect_tol": 1e-3,
+        "indirect_max_nodes": 1500,
+    }
+
+
+def attach_config(config, overrides=None):
+    """Attach Burgers OCP and system-specific attributes to config."""
+    overrides = overrides or {}
+    defaults = get_default_config()
+    for k, v in defaults.items():
+        setattr(config, k, overrides.get(k, v))
+    config.ocp = BurgersOCP(config)
+    config.B = config.ocp.B
+    config.q = config.ocp.R
+    config.x_f = config.ocp.X_bar.flatten()
+    config.xi = config.ocp.xi
+    config.w = config.ocp.w
+    config.norm = config.ocp.norm
+    config.dynamics = config.ocp.dynamics
+    config.running_cost = config.ocp.running_cost
+    config.running_cost_gradient = config.ocp.running_cost_gradient
+
+    def f_controlled(t, x, u, cfg):
+        return cfg.ocp.dynamics(x, u)
+
+    def jacobian_f(x, cfg):
+        dFdX, _ = cfg.ocp.jacobians(x, np.zeros((cfg.n_controls,)))
+        return dFdX
+
+    config.f_controlled = f_controlled
+    config.jacobian_f = jacobian_f
+
 
 class BurgersOCP(BaseOCP):
     """Burgers equation optimal control problem."""
-    
-    def __init__(self, config):
 
+    def __init__(self, config):
         n_states = config.n_states
         n_controls = config.n_controls
         # Burgers-specific parameters
-        self.nu = 0.012 # 0.01= hard, 0.02=easy
+        self.nu = 0.012  # 0.01= hard, 0.02=easy
         self.gamma = 0.1
         self.R = 0.5
-        kappa = 25.
+        kappa = 25.0
 
-        # Chebyshev nodes, differentiation matrices, and Clenshaw-Curtis weights
-        self.xi, self.D, self.w_flat = cheb(n_states + 1)
-        self.D2 = np.matmul(self.D, self.D)
-
-        # Truncate system to account for zero boundary conditions
-        self.xi = self.xi[1:-1].reshape(-1,1)
-        self.w_flat = self.w_flat[1:-1]
-        self.w = self.w_flat.reshape(-1,1)
-        self.D = self.D[1:-1, 1:-1]
-        self.D2 = self.D2[1:-1, 1:-1]
+        # Chebyshev + zero Dirichlet BC (interior only)
+        self.xi, self.D, self.D2, self.D3, self.w_flat, self.w = _build_dirichlet_operators(n_states)
 
         # Control multiplier - Burgers-specific spatial locations
         B = np.hstack((
@@ -88,36 +114,20 @@ class BurgersOCP(BaseOCP):
 
 
     def dynamics(self, X, U):
-        '''
+        """
         Burgers equation dynamics: dXdt = -0.5*D*X² + nu*D2*X + X*alpha*exp(-gamma*X) + B*U
-
-        Parameters
-        ----------
-        X : (n_states,) or (n_states, n_points) array
-            Current state.
-        U : (n_controls,) or (n_controls, n_points)  array
-            Feedback control U=U(X).
-
-        Returns
-        -------
-        dXdt : (n_states,) or (n_states, n_points) array
-            Dynamics dXdt = F(X,U).
-        '''
+        """
         flat_out = X.ndim < 2
         X = X.reshape(self.n_states, -1)
         U = U.reshape(self.n_controls, -1)
 
         dXdt = (
-            - 0.5*np.matmul(self.D, X**2)
-            + np.matmul(self.nu*self.D2, X)
+            -0.5 * (self.D @ X**2)
+            + (self.nu * self.D2) @ X
             + X * self.alpha * np.exp(-self.gamma * X)
-            + np.matmul(self.B, U)
+            + self.B @ U
         )
-
-        if flat_out:
-            dXdt = dXdt.flatten()
-
-        return dXdt
+        return dXdt.flatten() if flat_out else dXdt
 
     def jacobians(self, X, U, F0=None):
         '''
@@ -201,69 +211,21 @@ class BurgersOCP(BaseOCP):
 
         return np.vstack((dXdt, dAdt, -L))
 
-    def _torch_params(self, device=None, dtype=torch.float32):
-        device = device or torch.device("cpu")
-        return {
-            "D": torch.tensor(self.D, dtype=dtype, device=device),
-            "D2": torch.tensor(self.D2, dtype=dtype, device=device),
-            "B": torch.tensor(self.B, dtype=dtype, device=device),
-            "alpha": torch.tensor(self.alpha_flat, dtype=dtype, device=device),
-            "w": torch.tensor(self.w_flat, dtype=dtype, device=device),
-            "R": torch.tensor(self.R, dtype=dtype, device=device),
-            "nu": float(self.nu),
-            "gamma": float(self.gamma),
-        }
-
-    def physics_module(self):
-        return BurgersPhysics(self) 
-
-    def dynamics(self, X, U):
-        """NumPy version for ODE solvers/LSODA."""
-        flat_out = X.ndim < 2
-        X = X.reshape(self.n_states, -1)
-        U = U.reshape(self.n_controls, -1)
-
-        dXdt = (
-            -0.5 * (self.D @ X**2)
-            + (self.nu * self.D2) @ X
-            + X * self.alpha * np.exp(-self.gamma * X)
-            + self.B @ U
-        )
-        return dXdt.flatten() if flat_out else dXdt
+    def sample_initial_conditions(self, n: int, seed=None, K: int = 10):
+        """Burgers: Fourier-sine sum on grid (single-IC formula)."""
+        if seed is not None:
+            np.random.seed(seed)
+        d = self.n_states
+        xi = self.xi.flatten()
+        xi_pi = np.pi * xi
+        X0 = np.zeros((d, n))
+        for k in range(1, K + 1):
+            ak = (2.0 * np.random.rand(1, n) - 1.0) / float(k)
+            X0 += ak * np.sin(k * xi_pi).reshape(d, 1)
+        return X0
 
     def torch_dynamics(self, x, u):
-        return self.physics_module.dynamics(x, u)
+        return self.physics_module().dynamics(x, u)
 
     def torch_running_cost(self, x, u):
-        return self.physics_module.running_cost(x, u)
-
-
-class BurgersPhysics(torch.nn.Module):
-    def __init__(self, ocp): # Pass the OCP object directly
-        super().__init__()
-        # register_buffer ensures these move to GPU/CPU automatically
-        self.register_buffer("D", torch.from_numpy(ocp.D).float())
-        self.register_buffer("D2", torch.from_numpy(ocp.D2).float())
-        self.register_buffer("B", torch.from_numpy(ocp.B).float())
-        self.register_buffer("alpha", torch.from_numpy(ocp.alpha).float())
-        self.register_buffer("w", torch.from_numpy(ocp.w_flat).float())
-
-        self.R_val = float(ocp.R)
-        self.nu = float(ocp.nu)
-        self.gamma = float(ocp.gamma)
-
-    def get_control(self, dVdX: torch.Tensor) -> torch.Tensor:
-        u = -(0.5 / self.R_val) * (dVdX @ self.B)
-        return torch.clamp(u, -10.0, 10.0)
-
-    def dynamics(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-        x_T = x.t()
-        # Convection + Diffusion + Forcing + Control
-        f = (-0.5 * (self.D @ (x_T**2)) + 
-             self.nu * (self.D2 @ x_T) + 
-             x_T * self.alpha * torch.exp(-self.gamma * x_T) + 
-             self.B @ u.t())
-        return f.t()
-
-    def running_cost(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-        return (self.w * (x**2)).sum(dim=1) + self.R_val * (u**2).sum(dim=1)
+        return self.physics_module().running_cost(x, u)

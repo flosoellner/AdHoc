@@ -459,6 +459,7 @@ from tqdm import tqdm
 def monte_carlo(
         OCP, config, controller,
         X0_distance=None, random_seed=None, X0_pool=None,
+        n_MC=100, dist=None,
         solve_open_loop=False, verbose=0, suppress_warnings=True
     ):
     '''
@@ -469,13 +470,19 @@ def monte_carlo(
     controller : controller instance OR list of (name, controller) tuples
         If list, evaluates all controllers with the same initial conditions
     X0_distance : float, optional
-        Norm to use for random initial conditions
+        Norm to use for random initial conditions (deprecated, use dist instead)
     random_seed : int, optional
         Seed for numpy random number generator
     X0_pool : array, optional
-        Pre-computed initial conditions (n_states, n_MC)
+        Pre-computed initial conditions (n_states, n_MC). If provided, n_MC is inferred from shape.
+    n_MC : int, default=25
+        Number of Monte Carlo samples to evaluate
+    dist : float, optional
+        Distance/norm to use for random initial conditions
     solve_open_loop : bool, default=False
         Set to True to solve the open loop OCP for each initial condition.
+    verbose : int, default=0
+        Verbosity level
     suppress_warnings : bool, default=True
         If True, treat numpy warnings as OCP failures.
 
@@ -485,17 +492,16 @@ def monte_carlo(
     If list of controllers: dict with keys as controller names, values as results_dict
     '''
 
-    # Set default n_MC
-    n_MC = 100  # Default
-    dist_mc = None
+    # Use X0_distance if dist is not provided (backward compatibility)
+    if dist is None and X0_distance is not None:
+        dist = X0_distance
 
     # Check if controller is a list of (name, controller) tuples
     if isinstance(controller, list):
         # Generate X0_pool once for all controllers
         if X0_pool is None:
-
             np.random.seed(random_seed)
-            X0_pool = sampling.sample_conditions(config, n_MC, dist=dist_mc)
+            X0_pool = sampling.sample_conditions(config, n_MC, dist=dist)
         
         # Evaluate each controller with the same X0_pool
         all_results = {}
@@ -505,6 +511,7 @@ def monte_carlo(
             results = monte_carlo(
                 OCP, config, ctrl,
                 X0_distance=X0_distance, random_seed=None, X0_pool=X0_pool,
+                n_MC=n_MC, dist=dist,
                 solve_open_loop=solve_open_loop, verbose=verbose, suppress_warnings=suppress_warnings
             )
             all_results[name] = results
@@ -512,10 +519,10 @@ def monte_carlo(
         return all_results
 
     # Original single controller code continues below...
-    # Set n_MC from X0_pool if provided, otherwise use default
+    # Set n_MC from X0_pool if provided, otherwise use parameter/default
     if X0_pool is None:
         np.random.seed(random_seed)
-        X0_pool = sampling.sample_conditions(config, n_MC, dist=dist_mc)
+        X0_pool = sampling.sample_conditions(config, n_MC, dist=dist)
         bad = ~np.isfinite(X0_pool)
         bad_cols = np.where(bad.any(axis=0))[0]
         bad_cols[:10], len(bad_cols)
@@ -874,6 +881,15 @@ def solve_ocp(
             'config.ocp_solver must be one of "direct", "indirect", or "direct_to_indirect"'
         )
 
+    def _converged():
+        if getattr(config, 'system', None) == 'eikonal':
+            # Stationary HJB: success + small residual; skip L<=tol (running cost)
+            if solver.bvp_sol is None or not solver.bvp_sol.success:
+                return False
+            F = OCP.bvp_dynamics(solver.sol['t'][-1:], solver.bvp_sol.y[:, -1:])
+            return np.linalg.norm(F[:OCP.n_states]) <= config.fp_tol
+        return solver.check_converged(config.fp_tol)
+
     with warnings.catch_warnings():
         if suppress_warnings:
             np.seterr(over='warn', divide='warn', invalid='warn')
@@ -883,7 +899,7 @@ def solve_ocp(
             t=t_guess, X=X_guess, U=U_guess, dVdX=dVdX_guess, V=V_guess,
             verbose=verbose
         )
-        converged = solver.check_converged(config.fp_tol)
+        converged = _converged()
 
         # Solves the OCP over an extended time interval until convergece
         # conditions are satisfied
@@ -897,7 +913,7 @@ def solve_ocp(
             try:
                 while not converged and solver.extend_horizon():
                     solver.solve(**solver.sol, verbose=verbose)
-                    converged = solver.check_converged(config.fp_tol)
+                    converged = _converged()
             except RuntimeWarning:
                 pass
 
@@ -933,3 +949,109 @@ def clip_trajectory(t, X, U, criteria):
         converged_idx = t.shape[0] - 1
 
     return converged_idx, converged
+
+
+def process_robustness_results(robustness_results, controller_names):
+    """
+    Process robustness evaluation results into a summary DataFrame.
+    
+    Parameters
+    ----------
+    robustness_results : dict
+        Dictionary keyed by perturbation names, where each value is a dict
+        keyed by controller names, containing monte_carlo results.
+    controller_names : list
+        List of controller names to include in the summary.
+    
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with rows for each controller and columns for stability
+        and cost for each perturbation variant.
+    """
+    import pandas as pd
+    
+    summary_rows = []
+    
+    for ctrl_name in controller_names:
+        row = {"Controller": ctrl_name}
+        for pert_name, results in robustness_results.items():
+            # results is a dict keyed by controller names (from monte_carlo)
+            if ctrl_name not in results:
+                # Controller not evaluated for this perturbation
+                row[f"{pert_name} Stab."] = "N/A"
+                row[f"{pert_name} Cost"] = "N/A"
+                continue
+                
+            ctrl_results = results[ctrl_name]
+            
+            # Compute stats from results dict (similar to _compute_monte_carlo_stats)
+            NN_final_times = np.asarray(ctrl_results['NN_final_times'])
+            NN_costs = np.asarray(ctrl_results['NN_costs'])
+            
+            converged_mask = np.isfinite(NN_final_times)
+            n_converged = np.sum(converged_mask)
+            n_total = len(NN_final_times)
+            stability_rate = n_converged / n_total if n_total > 0 else 0.0
+            mean_cost = np.mean(NN_costs[converged_mask]) if n_converged > 0 else np.nan
+            
+            stability = stability_rate * 100
+            cost = mean_cost
+            row[f"{pert_name} Stab."] = f"{stability:.0f}%"
+            row[f"{pert_name} Cost"] = f"{cost:.2f}" if cost < 1e6 and not np.isnan(cost) else "—"
+        summary_rows.append(row)
+    
+    return pd.DataFrame(summary_rows)
+
+
+def process_robustness_results(robustness_results, controller_names):
+    """
+    Process robustness evaluation results into a summary DataFrame.
+    
+    Parameters
+    ----------
+    robustness_results : dict
+        Dictionary keyed by perturbation names, where each value is a dict
+        keyed by controller names, containing monte_carlo results.
+    controller_names : list
+        List of controller names to include in the summary.
+    
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with rows for each controller and columns for stability
+        and cost for each perturbation variant.
+    """
+    import pandas as pd
+    
+    summary_rows = []
+    
+    for ctrl_name in controller_names:
+        row = {"Controller": ctrl_name}
+        for pert_name, results in robustness_results.items():
+            # results is a dict keyed by controller names (from monte_carlo)
+            if ctrl_name not in results:
+                # Controller not evaluated for this perturbation
+                row[f"{pert_name} Stab."] = "N/A"
+                row[f"{pert_name} Cost"] = "N/A"
+                continue
+                
+            ctrl_results = results[ctrl_name]
+            
+            # Compute stats from results dict (similar to _compute_monte_carlo_stats)
+            NN_final_times = np.asarray(ctrl_results['NN_final_times'])
+            NN_costs = np.asarray(ctrl_results['NN_costs'])
+            
+            converged_mask = np.isfinite(NN_final_times)
+            n_converged = np.sum(converged_mask)
+            n_total = len(NN_final_times)
+            stability_rate = n_converged / n_total if n_total > 0 else 0.0
+            mean_cost = np.mean(NN_costs[converged_mask]) if n_converged > 0 else np.nan
+            
+            stability = stability_rate * 100
+            cost = mean_cost
+            row[f"{pert_name} Stab."] = f"{stability:.0f}%"
+            row[f"{pert_name} Cost"] = f"{cost:.2f}" if cost < 1e6 and not np.isnan(cost) else "—"
+        summary_rows.append(row)
+    
+    return pd.DataFrame(summary_rows)

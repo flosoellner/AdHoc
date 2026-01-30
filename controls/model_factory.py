@@ -40,7 +40,7 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "supervision": True,
     },
 
-    "Hybrid GradNet": {
+    "GradNet (pre)": {
         "enabled": False,
         "kind": "gradnet",
         "use_lqr": False,
@@ -48,7 +48,7 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "adaptive": False,
         "supervision": None,
     },
-    "Hybrid GradNet (sup)": {
+    "GradNet (pre/sup)": {
         "enabled": False,
         "kind": "gradnet",
         "use_lqr": False,
@@ -57,7 +57,7 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "supervision": True,
     },
 
-    "Hybrid GradQRNet": {
+    "GradQRNet (pre)": {
         "enabled": False,
         "kind": "gradnet",
         "use_lqr": True,
@@ -65,8 +65,8 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "adaptive": False,
         "supervision": None,
     },
-    "Hybrid GradQRNet (sup)": {
-        "enabled": True,
+    "GradQRNet (pre/sup)": {
+        "enabled": False,
         "kind": "gradnet",
         "use_lqr": True,
         "train_mode": "hybrid",
@@ -74,7 +74,7 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "supervision": True,
     },
 
-    "Ad. GradNet": {
+    "GradNet (ad)": {
         "enabled": False,
         "kind": "gradnet",
         "use_lqr": False,
@@ -82,7 +82,7 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "adaptive": True,
         "supervision": None,
     },
-    "Ad. GradNet (sup)": {
+    "GradNet (sup/ad)": {
         "enabled": False,
         "kind": "gradnet",
         "use_lqr": False,
@@ -91,7 +91,7 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "supervision": True,
     },
 
-    "Ad. GradQRNet": {
+    "GradQRNet (ad)": {
         "enabled": False,
         "kind": "gradnet",
         "use_lqr": True,
@@ -99,8 +99,8 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "adaptive": True,
         "supervision": None,
     },
-    "Ad. GradQRNet (sup)": {
-        "enabled": True,
+    "GradQRNet (sup/ad)": {
+        "enabled": False,
         "kind": "gradnet",
         "use_lqr": True,
         "train_mode": "unsupervised",
@@ -108,7 +108,7 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "supervision": True,
     },
 
-    "Ad. Hybrid GradNet": {
+    "GradNet (pre/ad)": {
         "enabled": False,
         "kind": "gradnet",
         "use_lqr": False,
@@ -116,7 +116,7 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "adaptive": True,
         "supervision": None,
     },
-    "Ad. Hybrid GradNet (sup)": {
+    "GradNet (pre/sup/ad)": {
         "enabled": False,
         "kind": "gradnet",
         "use_lqr": False,
@@ -125,7 +125,7 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "supervision": True,
     },
 
-    "Ad. Hybrid GradQRNet": {
+    "GradQRNet (pre/ad)": {
         "enabled": False,
         "kind": "gradnet",
         "use_lqr": True,
@@ -133,7 +133,15 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "adaptive": True,
         "supervision": None,
     },
-    "Ad. Hybrid GradQRNet (sup)": {
+    "GradQRNet (sup/ad)": {
+        "enabled": False,
+        "kind": "gradnet",
+        "use_lqr": True,
+        "train_mode": "unsupervised",
+        "adaptive": True,
+        "supervision": True,
+    },
+    "GradQRNet (pre/sup/ad)": {
         "enabled": False,
         "kind": "gradnet",
         "use_lqr": True,
@@ -220,7 +228,7 @@ def train_or_load_gradnet(
     val_data=None,  # NEW: validation data dict
 ):
     from controls.train import train_loop, loss_unified, make_loader_XG
-    from config import get_results_dir
+    from problems import get_results_dir
     
     if supervision is None:
         supervision = False

@@ -16,6 +16,11 @@ except:
 from scipy.optimize._numdiff import approx_derivative
 from scipy import sparse
 
+try:
+    import torch
+except ImportError:
+    torch = None
+
 
 def u_analytic(Vx: np.ndarray, config) -> np.ndarray:
     """
@@ -185,6 +190,84 @@ def cheb(N):
     return X_nodes, D, w
 
 
+def _build_neumann_operators(n_states: int):
+    """
+    Build Chebyshev collocation operators on [-1,1] with homogeneous Neumann BC,
+    returning interior operators of size (n_states, n_states).
+
+    We build a full grid of size n_full = n_states + 2, then eliminate boundary
+    values via Neumann constraints D1 y = 0 at both ends.
+    """
+    n_full = n_states + 2
+    x_nodes, D1_full, w_full = cheb(n_full - 1)  # -> (n_full,)
+    D2_full = D1_full @ D1_full
+
+    Bnd = np.array([0, n_full - 1])      # boundary indices
+    Int = np.arange(1, n_full - 1)       # interior indices (size n_states)
+
+    D1_BB = D1_full[np.ix_(Bnd, Bnd)]    # (2,2)
+    D1_BI = D1_full[np.ix_(Bnd, Int)]    # (2,n)
+    D2_IB = D2_full[np.ix_(Int, Bnd)]    # (n,2)
+    D2_II = D2_full[np.ix_(Int, Int)]    # (n,n)
+
+    # Neumann: D1_BB y_B + D1_BI y_I = 0  ->  y_B = E y_I
+    E = -np.linalg.solve(D1_BB, D1_BI)   # (2,n)
+
+    # Effective D2 on interior: D2_II y_I + D2_IB y_B
+    D2_eff = D2_II + D2_IB @ E           # (n,n)
+
+    # Effective D1 on interior: D1_II y_I + D1_IB y_B (for advection)
+    D1_IB = D1_full[np.ix_(Int, Bnd)]    # (n,2)
+    D1_II = D1_full[np.ix_(Int, Int)]    # (n,n)
+    D1_eff = D1_II + D1_IB @ E           # (n,n)
+
+    xi = x_nodes[Int].reshape(-1, 1)     # (n,1)
+    w_flat = w_full[Int]                  # (n,)
+    w = w_flat.reshape(-1, 1)            # (n,1)
+    D1_int = D1_full[np.ix_(Int, Int)]   # (n,n)
+
+    return xi, D1_int, D1_eff, D2_eff, w_flat, w
+
+
+
+def _build_dirichlet_operators(n_states: int):
+    """
+    Build Chebyshev operators with zero Dirichlet BC.
+    CRITICAL: Build D2 and D3 on the FULL grid before truncating to interior.
+    """
+    # Build full grid (n_states interior + 2 boundary nodes)
+    x_nodes, D_full, w_full = cheb(n_states + 1)
+    
+    # Compute the physics on the full physical grid first
+    D2_full = D_full @ D_full
+    D3_full = D_full @ D2_full
+
+    # Interior indices (dropping the first and last nodes)
+    xi = x_nodes[1:-1].reshape(-1, 1)
+    w_flat = w_full[1:-1]
+    w = w_flat.reshape(-1, 1)
+    
+    # Now truncate to get the interior operators
+    D = D_full[1:-1, 1:-1]
+    D2 = D2_full[1:-1, 1:-1]
+    D3 = D3_full[1:-1, 1:-1]
+
+    return xi, D, D2, D3, w_flat, w
+
+
+def _default_control_matrix(n_states: int, n_controls: int) -> np.ndarray:
+    """
+    Default uniform-identity control matrix: split state indices evenly across
+    controls. Use this when the problem has no specific spatial actuation;
+    otherwise override in the problem's __init__.
+    """
+    B = np.zeros((n_states, n_controls), dtype=float)
+    parts = np.array_split(np.arange(n_states), n_controls)
+    for j, idx in enumerate(parts):
+        B[idx, j] = 1.0
+    return B
+
+
 class BaseOCP:
     """Base class for optimal control problems - contains general methods."""
     
@@ -231,41 +314,34 @@ class BaseOCP:
         params_dict['w'] = self.w
         return params_dict
 
-    # In the norm() function, add validation:
     def norm(self, X, center_X_bar=True):
+        """
+        Default norm: weighted distance from reference. Uses self.w (quadrature
+        or other weights) and self.X_bar (None = regulate to zero). Subclasses
+        without Clenshaw–Curtis or with a different norm should override.
+        """
         X = X.reshape(self.n_states, -1)
-        
-        # Legacy code (always computed distance from zero):
-        # return np.sqrt(np.sum(X**2 * self.w, axis=0))
-        
-        # New code: compute distance from X_bar when center_X_bar=True
-        if center_X_bar:
-            # Validate X_bar exists and has correct shape
-            if not hasattr(self, 'X_bar') or self.X_bar is None:
-                # Fallback to distance from zero
-                return np.sqrt(np.sum(X**2 * self.w, axis=0))
-            
-            X_bar = self.X_bar.reshape(self.n_states, -1)
-            if X_bar.shape[0] != self.n_states:
-                raise ValueError(f"X_bar shape mismatch: {X_bar.shape} vs n_states={self.n_states}")
-            
-            X_err = X - X_bar
-            result = np.sqrt(np.sum(X_err**2 * self.w, axis=0))
-            
-            # Validate result
-            if not np.isfinite(result).all():
-                # Fallback to distance from zero if computation failed
-                return np.sqrt(np.sum(X**2 * self.w, axis=0))
-            
-            return result
-        else:
-            # For backward compatibility, allow computing distance from zero
-            return np.sqrt(np.sum(X**2 * self.w, axis=0))
+        ref = np.zeros((self.n_states, 1)) if self.X_bar is None else self.X_bar.reshape(self.n_states, -1)
+        if ref.shape[1] == 1 and X.shape[1] != 1:
+            ref = np.broadcast_to(ref, X.shape)
+        err = X - ref
+        if not center_X_bar:
+            err = X
+        return np.sqrt(np.sum(err**2 * self.w, axis=0))
 
+
+    def _state_error(self, X):
+        """State error from reference (self.X_bar; None = zero). Used in running cost."""
+        X = X.reshape(self.n_states, -1)
+        ref = np.zeros((self.n_states, 1)) if self.X_bar is None else np.asarray(self.X_bar).reshape(self.n_states, -1)
+        if ref.shape[1] == 1 and X.shape[1] != 1:
+            ref = np.broadcast_to(ref, X.shape)
+        return X - ref
 
     def running_cost(self, X, U, wX=None):
         '''
-        Evaluate the running cost L(X,U) at one or multiple state-control pairs.
+        Evaluate the running cost L(X,U) = ||X - X_ref||^2_w + R||U||^2 at one or
+        multiple state-control pairs. X_ref is self.X_bar if set, else zero.
 
         Parameters
         ----------
@@ -274,25 +350,34 @@ class BaseOCP:
         U : (n_controls,) or (n_controls, n_points) array
             Control(s) arranged by (dimension, time).
         wX : (n_states,) or (n_states, n_points) array, optional
-            States(s) multiplied by the Chebyshev quadrature weights.
+            Precomputed w * X (not used if X_ref is X_bar; pass wX only for legacy).
 
         Returns
         -------
         L : (1,) or (n_points,) array
             Running cost(s) L(X,U) evaluated at pair(s) (X,U).
         '''
+        X_err = self._state_error(X)
         if wX is None:
-            if X.ndim == 1:
-                wX = self.w_flat * X 
+            if X_err.ndim == 1:
+                wX_err = self.w_flat * X_err
             else:
-                wX = self.w * X 
-
-        return np.sum(wX * X, axis=0) + self.R * np.sum(U**2, axis=0)
+                wX_err = self.w * X_err
+        else:
+            # Legacy: wX was w*X; convert to w*(X - X_bar) when X_bar is set
+            if self.X_bar is None:
+                wX_err = wX
+            else:
+                ref = np.asarray(self.X_bar).reshape(self.n_states, -1)
+                if ref.shape[1] == 1 and X_err.shape[1] != 1:
+                    ref = np.broadcast_to(ref, X_err.shape)
+                wX_err = wX - (self.w * ref if X_err.ndim > 1 else self.w_flat * ref.flatten())
+        return np.sum(wX_err * X_err, axis=0) + self.R * np.sum(U**2, axis=0)
 
     def running_cost_gradient(self, X, U, return_dLdX=True, return_dLdU=True):
         '''
-        Evaluate the gradients of the running cost, dL/dX (X,U) and dL/dU (X,U),
-        at one or multiple state-control pairs.
+        Evaluate the gradients of the running cost: dL/dX = 2*w*(X - X_ref),
+        dL/dU = 2*R*U, with X_ref = self.X_bar if set else zero.
 
         Parameters
         ----------
@@ -312,11 +397,12 @@ class BaseOCP:
         dLdU : (n_states,) or (n_states, n_points) array
             Gradient dL/dU (X,U) evaluated at pair(s) (X,U).
         '''
+        X_err = self._state_error(X)
         if return_dLdX:
-            if X.ndim == 1:
-                dLdX = 2. * (self.w_flat * X) 
+            if X_err.ndim == 1:
+                dLdX = 2. * (self.w_flat * X_err)
             else:
-                dLdX = 2. * (self.w * X)
+                dLdX = 2. * (self.w * X_err)
             if not return_dLdU:
                 return dLdX
 
@@ -518,6 +604,14 @@ class BaseOCP:
 
         return approx_derivative(self.constraint_fun, X, f0=C0)
 
+    def sample_initial_conditions(self, n: int, seed=None, **kwargs):
+        """
+        Sample n initial conditions. Override in each problem; default raises
+        NotImplementedError. Returns (n_states, n) array. kwargs (e.g. K for
+        Fourier modes) are passed through for problem-specific options.
+        """
+        raise NotImplementedError("Subclass must implement sample_initial_conditions")
+
     def make_integration_events(self, x_max=4.0):
         import numpy as np
 
@@ -528,3 +622,107 @@ class BaseOCP:
         explosion_event.terminal = True
         explosion_event.direction = 1
         return [explosion_event]
+
+    def physics_module(self):
+        """Return a torch.nn.Module that wraps this OCP's dynamics and cost for autodiff."""
+        if torch is None:
+            raise ImportError("PyTorch is required for physics_module()")
+        return BasePhysics(self)
+
+
+# ---------------------------------------------------------------------------
+# Torch physics wrapper: single source of truth from OCP (NumPy) methods
+# ---------------------------------------------------------------------------
+
+if torch is not None:
+
+    class _OCPDynamicsFunc(torch.autograd.Function):
+        """Forward: ocp.dynamics; backward: ocp.jacobians."""
+
+        @staticmethod
+        def forward(ctx, x, u, ocp):
+            # x (B, n), u (B, m) -> X (n, B), U (m, B)
+            X = x.detach().cpu().numpy().T
+            U = u.detach().cpu().numpy().T
+            F = ocp.dynamics(X, U)
+            if F.ndim == 1:
+                F = F.reshape(-1, X.shape[1])
+            ctx.ocp = ocp
+            ctx.save_for_backward(x, u)
+            out = torch.from_numpy(F.T.copy()).to(device=x.device, dtype=x.dtype)
+            return out
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            ocp = ctx.ocp
+            x, u = ctx.saved_tensors
+            X = x.cpu().numpy().T   # (n, B)
+            U = u.cpu().numpy().T   # (m, B)
+            dFdX, dFdU = ocp.jacobians(X, U)  # (n, n, B), (n, m, B)
+            go = grad_output.cpu().numpy().T  # (n, B)
+            # grad_x[b,i] = sum_j dFdX[j,i,b]*go[j,b]  -> (B, n)
+            grad_x = np.einsum("jib,jb->bi", dFdX, go)
+            # grad_u[b,k] = sum_i dFdU[i,k,b]*go[i,b]  -> (B, m)
+            grad_u = np.einsum("ikb,ib->bk", dFdU, go)
+            return (
+                torch.from_numpy(grad_x).to(x.device, x.dtype),
+                torch.from_numpy(grad_u).to(u.device, u.dtype),
+                None,
+            )
+
+    class _OCPRunningCostFunc(torch.autograd.Function):
+        """Forward: ocp.running_cost; backward: ocp.running_cost_gradient."""
+
+        @staticmethod
+        def forward(ctx, x, u, ocp):
+            X = x.detach().cpu().numpy().T
+            U = u.detach().cpu().numpy().T
+            L = ocp.running_cost(X, U)
+            if np.isscalar(L):
+                L = np.full(X.shape[1], L, dtype=X.dtype)
+            ctx.ocp = ocp
+            ctx.save_for_backward(x, u)
+            out = torch.from_numpy(np.asarray(L).ravel().copy()).to(device=x.device, dtype=x.dtype)
+            return out
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            ocp = ctx.ocp
+            x, u = ctx.saved_tensors
+            X = x.cpu().numpy().T
+            U = u.cpu().numpy().T
+            dLdX, dLdU = ocp.running_cost_gradient(X, U)
+            go = grad_output.cpu().numpy().ravel()  # (B,)
+            grad_x = (go[:, None] * dLdX.T).astype(X.dtype)
+            grad_u = (go[:, None] * dLdU.T).astype(U.dtype)
+            return (
+                torch.from_numpy(grad_x).to(x.device, x.dtype),
+                torch.from_numpy(grad_u).to(u.device, u.dtype),
+                None,
+            )
+
+    class BasePhysics(torch.nn.Module):
+        """
+        Torch wrapper for any BaseOCP. dynamics and running_cost delegate to the
+        OCP's NumPy methods (with autograd via jacobians / running_cost_gradient).
+        get_control uses OCP's B and R (differentiable in torch).
+        """
+
+        def __init__(self, ocp, u_clamp=10.0):
+            super().__init__()
+            self._ocp = ocp
+            self.u_clamp = float(u_clamp)
+            self.register_buffer("B", torch.from_numpy(np.asarray(ocp.B)).float())
+            R = getattr(ocp, "R", 0.5)
+            self.R_val = float(R) if np.isscalar(R) else float(np.asarray(R).flat[0])
+
+        def get_control(self, dVdX: torch.Tensor) -> torch.Tensor:
+            # u* = -(1/(2R)) B^T dVdX  ->  (B, m) from (B, n) @ (n, m)
+            u = -(0.5 / self.R_val) * (dVdX @ self.B)
+            return torch.clamp(u, -self.u_clamp, self.u_clamp)
+
+        def dynamics(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+            return _OCPDynamicsFunc.apply(x, u, self._ocp)
+
+        def running_cost(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+            return _OCPRunningCostFunc.apply(x, u, self._ocp)

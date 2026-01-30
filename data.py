@@ -12,9 +12,11 @@ _headers = (
     '-----------------------------------'
 )
 
+n_candidates = 200 # burgers: 200
+
 def generate(
         OCP, config, n_trajectories, controller=None, resolve_failed=True,
-        verbose=0, suppress_warnings=True
+        verbose=0, suppress_warnings=True, adaptive_sampling="gradient"
     ):
     '''
     Generate data for an OCP by solving n_trajectories open loop OCPs. Uses LQR
@@ -39,6 +41,8 @@ def generate(
         See scipy.integrate.solve_bvp
     suppress_warnings : bool, default=True
         If True, treat numpy warnings as BVP failures
+    adaptive_sampling : str, default="gradient"
+        Adaptive sampling method: "gradient" (gradient residual) or "hjb" (HJB residual norm)
 
     Returns
     -------
@@ -72,48 +76,44 @@ def generate(
     def open_converged(X, U):
         return OCP.running_cost(X, U) < config.fp_tol
 
-    # Use adaptive sampling with LQR controller to generate initial conditions
-    # If controller is None, use LQR; otherwise use the provided controller
+    # Eikonal (Section 3.2 & 4.3): uniform x0 in [-1,1] only. Others: adaptive sampling.
     sampling_controller = OCP.LQR
+
     X0_pool, _ = sampling.adaptive_sample_conditions(
-        config, n_trajectories, 
+        config, n_trajectories,
         controller=sampling_controller,
-        n_candidates=200,  # or adjust as needed
+        n_candidates=n_candidates, # burgers: 200
         seed=config.seed
     )
-    # adaptive_sample_conditions returns (d, n), so reshape if needed
     if X0_pool.shape[0] != OCP.n_states:
         X0_pool = X0_pool.T  # Ensure (n_states, n_trajectories)
-    
-    # Validate X0_pool - filter out any non-finite values
+
     valid_mask = np.isfinite(X0_pool).all(axis=0)
     if not valid_mask.all():
         n_invalid = np.sum(~valid_mask)
         print(f"Warning: {n_invalid} non-finite initial conditions detected, filtering them out.")
         X0_pool = X0_pool[:, valid_mask]
-        # If we lost too many, resample to get enough
-        if X0_pool.shape[1] < n_trajectories:
-            n_needed = n_trajectories - X0_pool.shape[1]
+    if X0_pool.shape[1] < n_trajectories:
+        n_needed = n_trajectories - X0_pool.shape[1]
+        if config.system == "eikonal":
+            X0_additional = sampling.sample_conditions(config, n_needed, seed=None)
+        else:
             X0_additional, _ = sampling.adaptive_sample_conditions(
-                config, n_needed,
-                controller=sampling_controller,
-                n_candidates=5,
-                seed=None  # Don't reset seed, continue from current state
+                config, n_needed, controller=sampling_controller,
+                n_candidates=n_candidates, seed=None
             )
-            if X0_additional.shape[0] != OCP.n_states:
-                X0_additional = X0_additional.T
-            # Filter additional samples too
-            valid_additional = np.isfinite(X0_additional).all(axis=0)
-            X0_additional = X0_additional[:, valid_additional]
-            if X0_additional.shape[1] > 0:
-                X0_pool = np.hstack([X0_pool, X0_additional])
-            # If still not enough, pad with simple samples
-            if X0_pool.shape[1] < n_trajectories:
-                n_still_needed = n_trajectories - X0_pool.shape[1]
-                X0_simple = sampling.sample_conditions(config, n_still_needed, seed=None)
-                if X0_simple.shape[0] != OCP.n_states:
-                    X0_simple = X0_simple.T
-                X0_pool = np.hstack([X0_pool, X0_simple[:, :n_still_needed]])
+        if X0_additional.shape[0] != OCP.n_states:
+            X0_additional = X0_additional.T
+        valid_additional = np.isfinite(X0_additional).all(axis=0)
+        X0_additional = X0_additional[:, valid_additional]
+        if X0_additional.shape[1] > 0:
+            X0_pool = np.hstack([X0_pool, X0_additional])
+    if X0_pool.shape[1] < n_trajectories:
+        n_still_needed = n_trajectories - X0_pool.shape[1]
+        X0_simple = sampling.sample_conditions(config, n_still_needed, seed=None)
+        if X0_simple.shape[0] != OCP.n_states:
+            X0_simple = X0_simple.T
+        X0_pool = np.hstack([X0_pool, X0_simple[:, :n_still_needed]])
 
     n_attempt = 0
     n_sol = 0
@@ -145,10 +145,11 @@ def generate(
             if n_track() >= X0_pool.shape[1]:
                 # Need more samples - resample
                 n_needed = n_trajectories - n_track()
+
                 X0_additional, _ = sampling.adaptive_sample_conditions(
                     config, n_needed,
                     controller=sampling_controller,
-                    n_candidates=5,
+                    n_candidates=n_candidates, # burgers: 5
                     seed=None
                 )
                 if X0_additional.shape[0] != OCP.n_states:
@@ -213,25 +214,15 @@ def generate(
                     # Simulation produced invalid results, treat as failure
                     warnings.warn(UserWarning())
                     raise RuntimeWarning("Simulation produced non-finite values")
-
+# Modified Logic
                 if ode_converged:
                     V, dVdX, U = controller.bvp_guess(X)
                 else:
-                    # Warm start failed - this is a failure, but we can still try to solve OCP
-                    # with the interpolated guess. However, we should note this as a failure
-                    # if the OCP also fails to converge.
-                    # Use linear interpolation if the warm start controller failed
-                    # to stabilize the system
-                    t = np.linspace(
-                        0., config.t1_initial, config.direct_n_init_nodes
-                    )
-                    X = np.hstack((X0.reshape(-1,1), OCP.X_bar))
-                    X = interp1d([0., config.t1_initial], X)(t)
+                    # Still use the WarmStart physics for the guess! 
+                    # Do NOT reset V and dVdX to zero.
+                    t_raw = t # preserve the simulation time
+                    V, dVdX, U = controller.bvp_guess(X)
 
-                    V = np.zeros_like(t)
-                    dVdX = np.zeros_like(X)
-                    U = np.tile(OCP.U_bar, (1,X.shape[1]))
-                    # Note: ode_converged=False, but we'll continue to try OCP solve
 
                 # Solves the two-point BVP until to convergence to infinite
                 # horizon approximation
@@ -239,7 +230,8 @@ def generate(
                     OCP, config,
                     t_guess=t, X_guess=X, U_guess=U, dVdX_guess=dVdX, V_guess=V,
                     solve_to_converge=True,
-                    verbose=verbose, suppress_warnings=suppress_warnings
+                    verbose=verbose,  # Set this to 2
+                    suppress_warnings=suppress_warnings
                 )
 
                 if ocp_converged:
@@ -319,7 +311,7 @@ import os, json, hashlib
 import torch
 import numpy as np
 
-def _fingerprint(config, n_trajectories, controller):
+def _fingerprint(config, n_trajectories, controller, adaptive_sampling="gradient"):
     ctrl_name = controller.__class__.__name__ if controller is not None else "None"
 
     payload = dict(
@@ -339,6 +331,7 @@ def _fingerprint(config, n_trajectories, controller):
         indirect_max_nodes=config.indirect_max_nodes,
 
         controller=ctrl_name,
+        adaptive_sampling=adaptive_sampling,
     )
     s = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha1(s).hexdigest(), payload
@@ -346,13 +339,13 @@ def _fingerprint(config, n_trajectories, controller):
 
 
 
-def load_or_generate(config, n_trajectories, *, controller=None, cache_dir=None, force_regen=False, val_split=0.2, **kwargs):
+def load_or_generate(config, n_trajectories, *, controller=None, cache_dir=None, force_regen=False, val_split=0.2, adaptive_sampling="gradient", **kwargs):
     if cache_dir is None:
-        from config import get_results_dir
+        from problems import get_results_dir
         cache_dir = get_results_dir(config, "data")
     os.makedirs(cache_dir, exist_ok=True)
 
-    key, meta = _fingerprint(config, n_trajectories, controller)
+    key, meta = _fingerprint(config, n_trajectories, controller, adaptive_sampling=adaptive_sampling)
     path_train = os.path.join(cache_dir, f"pmp_{key}_train.npz")
     path_val = os.path.join(cache_dir, f"pmp_{key}_val.npz")
 
@@ -369,6 +362,7 @@ def load_or_generate(config, n_trajectories, *, controller=None, cache_dir=None,
     dataset, n_attempt, n_fail, sol_time, fail_time = generate(
         config.ocp, config, n_trajectories,
         controller=controller,
+        adaptive_sampling=adaptive_sampling,
         **kwargs
     )
 

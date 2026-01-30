@@ -1,15 +1,45 @@
+"""
+figures.py: plotting and tables in one module. Shared output path logic.
+"""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import torch
 from matplotlib.colors import LinearSegmentedColormap
+from IPython.display import display, Markdown
 
 from sampling import sample_conditions
 from simulation import sim_closed_loop
 
+
+# -------------------------------------------------------------------------
+# Shared: single helper for experiments/results/{system}/seed_{seed}/{subdir}/filename
+# -------------------------------------------------------------------------
+
+def _output_path(savepath, config=None, subdir="plots"):
+    """
+    If config has system/seed, resolve savepath to experiments/results/{system}/seed_{seed}/{subdir}/filename.
+    Otherwise return savepath unchanged. subdir is "plots" or "tables".
+    """
+    if savepath is None:
+        return None
+    p = Path(savepath)
+    if p.is_absolute():
+        return p if subdir == "plots" else str(p)
+    if config and hasattr(config, "system") and hasattr(config, "seed"):
+        from problems import get_results_dir
+        return str(Path(get_results_dir(config, subdir)) / p.name)
+    return p if subdir == "plots" else savepath
+
+
+# -------------------------------------------------------------------------
+# Plotting
+# -------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------
 # Styling helpers
@@ -19,43 +49,11 @@ def _infer_system(config=None) -> str | None:
     if config is not None and hasattr(config, "system"):
         s = getattr(config, "system")
         return None if s is None else str(s)
-    # fallback: use the repo's config.py default
     try:
-        import config as _cfg  # type: ignore
-        s = getattr(_cfg, "system", None)
-        return None if s is None else str(s)
+        from problems import default_system
+        return default_system
     except Exception:
         return None
-
-
-def _with_system_figures_subdir(savepath, config=None):
-    """
-    If savepath is under figures/ or thesis/figures/, automatically write into 
-    results/{system}/seed_{seed}/thesis/figures/...
-
-    Examples:
-      figures/foo.pdf -> results/allen_cahn/seed_7/thesis/figures/foo.pdf
-      thesis/figures/foo.pdf -> results/allen_cahn/seed_7/thesis/figures/foo.pdf
-    """
-    if savepath is None:
-        return None
-    p = Path(savepath)
-    if p.is_absolute():
-        return p
-    
-    # If config is provided, use new results directory structure
-    if config and hasattr(config, "system") and hasattr(config, "seed"):
-        from config import get_results_dir
-        # Check if path starts with figures/ or thesis/figures/
-        if str(p).startswith("figures/") or str(p).startswith("thesis/figures/"):
-            # Extract filename
-            filename = p.name
-            # Use new structure
-            new_path = get_results_dir(config, "thesis/figures")
-            return str(Path(new_path) / filename)
-    
-    # If no config or path doesn't match, return as-is
-    return p
 
 
 def _iter_named_controllers(controllers):
@@ -213,7 +211,7 @@ def plot_value_vs_state_norm(
     ax.grid(True, alpha=0.3)
     ax.legend()
 
-    _save_fig(fig, _with_system_figures_subdir(savepath, config))
+    _save_fig(fig, _output_path(savepath, config, "plots"))
     return fig
 
 class _ZeroController:
@@ -231,7 +229,7 @@ def plot_3d(
     *,
     config,
     controller,
-    tspan=(0.0, 20.0),
+    tspan=None,
     Nt=250,
     seed=0,
     dist=None,
@@ -243,17 +241,23 @@ def plot_3d(
     cmap=cmap,
     savepath=None,
 ):
+    if savepath is None and config is not None and hasattr(config, "system"):
+        savepath = f"figures/{config.system}_3d.pdf"
     # 1) sample one IC
     X0 = sample_conditions(config, n=1, seed=seed, dist=dist)[:, 0]
 
-    # 2) common time grid
+    # 2) Use t1_initial from config if tspan not provided
+    if tspan is None:
+        tspan = (0.0, config.t1_initial)
+    
+    # 3) common time grid
     t_eval = np.linspace(float(tspan[0]), float(tspan[1]), int(Nt))
 
-    # 3) events
+    # 4) events
     if events == "auto":
         events = config.ocp.make_integration_events()
 
-    # 4) simulate
+    # 5) simulate
     t_u, X_u, _ = sim_closed_loop(
         config.ocp.dynamics, config.ocp.closed_loop_jacobian,
         _ZeroController(config),
@@ -265,12 +269,25 @@ def plot_3d(
         tspan=list(tspan), X0=X0, t_eval=t_eval, events=events, solver=solver
     )
 
-    # 5) plot
-    xi = np.asarray(config.xi).reshape(-1)
+
+
+    # 6) plot
+# 6) plot
+    # Check if we are in a state-space system (Finance/VdP) or a PDE system
+    if config.xi is None:
+        # For Finance, we treat the 'Asset Index' as the y-axis
+        xi = np.arange(config.n_states) 
+    else:
+        xi = np.asarray(config.xi).reshape(-1)
+
+    # Ensure X_u and X_c are shaped as (n_states, n_time_steps)
     if X_u.shape[0] != xi.size:
-        raise ValueError(f"Mismatch: X has {X_u.shape[0]} states but xi has {xi.size} points")
+        # Fallback for state-space systems if xi was misconfigured
+        xi = np.arange(X_u.shape[0])
 
     Tg, Xig = np.meshgrid(t_eval, xi)
+
+    # ... rest of the plotting code ...
 
     # --- create figure/axes (NO constrained_layout for 3D) ---
     fig = plt.figure(figsize=(7.8, 3.2), constrained_layout=False)
@@ -285,8 +302,8 @@ def plot_3d(
     ax2.plot_surface(Tg, Xig, X_c, cmap=cmap, linewidth=0, antialiased=True)
 
     # --- “subcaptions” closer to the plots ---
-    ax1.set_title("Uncontrolled", pad=-6)
-    ax2.set_title("Controlled", pad=-6)
+    ax1.set_title(r"$\bm{u}\equiv 0$", pad=-6)
+    ax2.set_title(r"$\bm{u}\equiv\bm{u}^*$", pad=-6)
 
     zmax = float(np.nanmax(np.abs(np.concatenate([X_u.ravel(), X_c.ravel()]))))
     if not np.isfinite(zmax) or zmax <= 0:
@@ -327,7 +344,7 @@ def plot_3d(
         # optional: also reduce tick marks themselves
         ax.tick_params(length=0)
 
-    _save_fig(fig, _with_system_figures_subdir(savepath, config))
+    _save_fig(fig, _output_path(savepath, config, "plots"))
 
     return fig
 
@@ -386,7 +403,10 @@ def plot_value_analysis_combined(
     title=None,
     figsize=(6.2, 9.6),  # 3 plots stacked vertically
     savepath=None,
+    suffix: str = "",    # used for default savepath: figures/{system}_value_analysis{suffix}.pdf
 ):
+    if savepath is None and config is not None and hasattr(config, "system"):
+        savepath = f"figures/{config.system}_value_analysis{suffix}.pdf"
     """
     Creates three separate plots and saves each as a PNG file:
     1. Value vs state norm (scatter)
@@ -452,7 +472,7 @@ def plot_value_analysis_combined(
     ax1.set_title("Value vs State Norm")
     ax1.grid(True, alpha=0.3)
     ax1.legend()
-    _save_fig(fig1, _with_system_figures_subdir(savepath1, config))
+    _save_fig(fig1, _output_path(savepath1, config, "plots"))
     
     # ============================================================
     # Plot 2: Value Flow
@@ -498,7 +518,7 @@ def plot_value_analysis_combined(
     ax2.set_title("Value Flow")
     ax2.grid(True, alpha=0.3)
     ax2.legend()
-    _save_fig(fig2, _with_system_figures_subdir(savepath2, config))
+    _save_fig(fig2, _output_path(savepath2, config, "plots"))
     
     # ============================================================
     # Plot 3: HJB Residual Shock Line
@@ -571,15 +591,15 @@ def plot_value_analysis_combined(
         ax3.plot(s_grid, ys, label=str(name), color=color)
     
     ax3.set_xlabel(r"shock intensity $s$ (state $x = s\,x_{\mathrm{shock}}$)")
-    ylab = (r"$\log_{10}(|H|)$" if (metric == "abs" and log10) else
-            r"$\log_{10}(H^2)$" if (metric == "sq" and log10) else
-            r"$|H(x)|$" if metric == "abs" else
-            r"$H(x)^2$")
+    ylab = (r"$\log_{10}(|\mathcal{H}|)$" if (metric == "abs" and log10) else
+            r"$\log_{10}(|\mathcal{H}|^2)$" if (metric == "sq" and log10) else
+            r"$|\mathcal{H}|$" if metric == "abs" else
+            r"$|\mathcal{H}|^2$")
     ax3.set_ylabel(ylab)
     ax3.set_title("HJB Residual")
     ax3.grid(True, alpha=0.3)
     ax3.legend()
-    _save_fig(fig3, _with_system_figures_subdir(savepath3, config))
+    _save_fig(fig3, _output_path(savepath3, config, "plots"))
     
     return fig1, fig2, fig3
 
@@ -664,7 +684,7 @@ def plot_space_time_heatmap(
     cb = fig.colorbar(im, ax=ax, pad=0.02)
     cb.set_label(r"$x(t,\xi)$")
 
-    _save_fig(fig, _with_system_figures_subdir(savepath, config))
+    _save_fig(fig, _output_path(savepath, config, "plots"))
     return fig
 
 def plot_gradient_attention_heatmap(
@@ -752,7 +772,7 @@ def plot_gradient_attention_heatmap(
     cb = fig.colorbar(im, ax=ax, pad=0.02)
     cb.set_label(lab)
 
-    _save_fig(fig, _with_system_figures_subdir(savepath, config))
+    _save_fig(fig, _output_path(savepath, config, "plots"))
     return fig
 
 def plot_training_losses(
@@ -768,6 +788,7 @@ def plot_training_losses(
     figsize=(6.2, 3.2),
     savepath=None,
     config=None,
+    plot_name: str = "loss_curve",   # used for default savepath: figures/{system}_{plot_name}.pdf
     # NEW: multi-series support (preferred)
     series=None,  # list of (name, iters, losses)
     # NEW:
@@ -775,6 +796,8 @@ def plot_training_losses(
     ema_alpha: float = 0.03,        # for EMA
     ma_window: int = 200,           # for moving average
 ):
+    if savepath is None and config is not None and hasattr(config, "system"):
+        savepath = f"figures/{config.system}_{plot_name}.pdf"
     # Allow passing history dicts: (name, history_dict) or (name, iters, losses, phase)
     norm_series = []
     for item in series:
@@ -860,5 +883,382 @@ def plot_training_losses(
         ax.set_title(title)
     ax.grid(True, which="both", alpha=0.3)
     ax.legend()
-    _save_fig(fig, _with_system_figures_subdir(savepath, config))
+    _save_fig(fig, _output_path(savepath, config, "plots"))
     return fig, ax
+
+# -------------------------------------------------------------------------
+# Tables
+# -------------------------------------------------------------------------
+
+def eikonal_eval_series(ocp, controller, X_val=None, dVdX_val=None):
+    """
+    Eikonal evaluation metrics as a pandas Series.
+    HJB residual always; MSE vs exact only when dim_d == 1.
+    """
+    from evaluation import evaluate_eikonal
+    m = evaluate_eikonal(ocp, controller, X_val=X_val, dVdX_val=dVdX_val)
+    row = {"HJB res (mean)": m["hjb_residual_mean"], "HJB res (max)": m["hjb_residual_max"]}
+    if m["mse_grad"] is not None:
+        row["MSE ∇V"] = m["mse_grad"]
+    if m["mse_V"] is not None:
+        row["MSE V"] = m["mse_V"]
+    return pd.Series(row)
+
+def save_dataframe_latex(df, savepath, caption=None, label=None, precision=4):
+    os.makedirs(os.path.dirname(savepath) or ".", exist_ok=True)
+    disp_df = df.copy()
+    
+    def fmt(x):
+        if isinstance(x, (float, np.floating)):
+            return f"{x:.2e}" if (abs(x) < 1e-4 or abs(x) > 1e4) else f"{x:.{precision}g}"
+        return str(x)
+
+    def escape_tex(s):
+        return str(s).replace("_", "\\_").replace("%", "\\%").replace("&", "\\&")
+        
+    for col in disp_df.columns:
+        disp_df[col] = disp_df[col].map(fmt).map(escape_tex)
+    disp_df.columns = disp_df.columns.map(escape_tex)
+
+    # Use Styler for Pandas 2.0+
+    styler = disp_df.style.hide(axis="index")
+    latex_str = styler.to_latex(
+        column_format="l" + "r" * (len(df.columns) - 1),
+        hrules=True, label=label, caption=caption,
+        position="H", position_float="centering"
+    )
+
+    with open(savepath, "w", encoding="utf-8") as f:
+        f.write(latex_str)
+
+# --- Notebook Display Helper ---
+
+def show_spec(obj, keys, title=None):
+    """
+    Cleaner replacement for show_katex_array.
+    Creates a spec on the fly and displays it as a styled HTML table.
+    """
+    valid_keys = [k for k in keys if hasattr(obj, k)]
+    vals = [getattr(obj, k) for k in valid_keys]
+    
+    df = pd.DataFrame([vals], columns=valid_keys)
+    if title:
+        display(Markdown(f"**{title}**"))
+    
+    # Stylish Jupyter display
+    display(df.style.hide(axis="index").set_table_styles([
+        {'selector': 'th', 'props': [('background-color', '#f4f4f4'), ('color', 'black'), ('font-weight', 'bold')]}
+    ]))
+
+# --- Specific Thesis Helpers ---
+
+def save_config_table(config, savepath="config.tex"):
+    """Save config table in horizontal format (one row of headers, one row of values)."""
+    keys = ["system", "seed", "n_states", "n_controls", "t1_initial", "fp_tol"]
+    valid_keys = [k for k in keys if hasattr(config, k)]
+    values = [getattr(config, k) for k in valid_keys]
+    
+    # Format values
+    formatted_values = []
+    for k, v in zip(valid_keys, values):
+        if k == "system":
+            formatted_values.append(str(v))
+        elif k == "seed":
+            formatted_values.append(str(int(v)))
+        elif k in ["n_states", "n_controls"]:
+            formatted_values.append(str(int(v)))
+        elif k == "t1_initial":
+            formatted_values.append(f"{v:.1f}")
+        elif k == "fp_tol":
+            formatted_values.append(f"{v:.0e}")
+        else:
+            formatted_values.append(str(v))
+    
+    full_path = _output_path(savepath, config, "tables")
+    os.makedirs(os.path.dirname(full_path) or ".", exist_ok=True)
+    
+    # Format header names
+    header_map = {
+        "system": "system",
+        "seed": "seed",
+        "n_states": "$n$",
+        "n_controls": "$m$",
+        "t1_initial": "$t_1$",
+        "fp_tol": "$\\epsilon$"
+    }
+    headers = [header_map.get(k, k) for k in valid_keys]
+    
+    with open(full_path, "w", encoding="utf-8") as f:
+        n_cols = len(valid_keys)
+        f.write(f"\\begin{{tabular}}{{@{{}}{'c' * n_cols}@{{}}}}\n")
+        f.write("\\toprule\n")
+        f.write(" & ".join(headers) + " \\\\\n")
+        f.write("\\midrule\n")
+        f.write(" & ".join(formatted_values) + " \\\\\n")
+        f.write("\\bottomrule\n")
+        f.write("\\end{tabular}\n")
+
+def save_results_table(results_list, config=None, savepath="results.tex"):
+    """
+    Reformats the flat results list into a professional Thesis table.
+    Groups by Controller and stacks Standard/Hard datasets as rows.
+    """
+    import pandas as pd
+    df = pd.DataFrame(results_list)
+    
+    # 1. Clean up the naming for the Thesis
+    # Use LaTeX math mode for headers (e.g., $t_{conv}$)
+    rename_map = {
+        "Controller": "Method",
+        "Dataset": "Data",
+        "Stability (S)": "$S$",
+        "Avg Cost (J)": "$J_{\text{avg}}$"
+    }
+    df = df.rename(columns=rename_map)
+
+    # 2. Reorder columns to put Method and Data first
+    cols = ["Method", "Data", "$S$", "$t_{\text{conv}}$", "$J_{\text{avg}}$"]
+    df = df[[c for c in cols if c in df.columns]]
+
+    # 3. Format 'S' as a proper percentage if it's a float
+    if "$S$" in df.columns:
+        df["$S$"] = df["$S$"].apply(lambda x: f"{x:.0%}" if isinstance(x, (float, int)) else x)
+
+    # 4. Save using our fixed LaTeX function
+    full_path = _output_path(savepath, config, "tables")
+    save_dataframe_latex(
+        df, 
+        full_path, 
+        caption="Performance comparison of learned controllers vs. LQR baseline.", 
+        label="tab:results"
+    )
+
+def save_data_summary_table(config, data, savepath="data_summary.tex"):
+    """Save data summary table in specific LaTeX format."""
+    import numpy as np
+    
+    X_all = np.asarray(data["X"])
+    t_all = np.asarray(data["t"]).reshape(-1)
+    X_norms = config.norm(X_all).reshape(-1)
+    
+    n_traj = int(data.get("n_trajectories", -1))
+    n_points = int(X_all.shape[1])
+    t_min = t_all.min()
+    t_max = t_all.max()
+    abs_x_mean = np.mean(np.abs(X_all))
+    abs_x_max = np.max(np.abs(X_all))
+    norm_x_mean = np.mean(X_norms)
+    norm_x_max = np.max(X_norms)
+    
+    full_path = _output_path(savepath, config, "tables")
+    os.makedirs(os.path.dirname(full_path) or ".", exist_ok=True)
+    
+    with open(full_path, "w", encoding="utf-8") as f:
+        f.write("\\begin{tabular}{@{}cccccccc@{}}\n")
+        f.write("\\toprule\n")
+        f.write("$N_{\\mathrm{traj}}$ & $|\\mathcal{D}|$ & $t$ (min) & $t$ (max) & $|x|$ (mean) & $|x|$ (max)& $||x||$ (mean)& $||x||$ (max)\\\\\n")
+        f.write("\\midrule\n")
+        f.write(f"{n_traj} & {n_points} & {t_min:.2f} & {t_max:.2f} & {abs_x_mean:.2f} & {abs_x_max:.2f} & {norm_x_mean:.2f} & {norm_x_max:.2f} \\\\\n")
+        f.write("\\bottomrule\n")
+        f.write("\\end{tabular}\n")
+    
+    # Return a DataFrame for compatibility
+    return pd.DataFrame({
+        "$N_{\\mathrm{traj}}$": [n_traj],
+        "$|\\mathcal{D}|$": [n_points],
+        "t (min)": [t_min],
+        "t (max)": [t_max],
+        "|x| (mean)": [abs_x_mean],
+        "|x| (max)": [abs_x_max],
+        "||x|| (mean)": [norm_x_mean],
+        "||x|| (max)": [norm_x_max]
+    })
+
+def save_params_table(obj, savepath, title="Configuration", keys=None, config=None):
+    """Generic function to save any object's attributes to a LaTeX table."""
+    if keys is None:
+        keys = [k for k in obj.__dict__.keys() if not k.startswith('_')]
+    
+    data = {
+        "Parameter": [str(k) for k in keys if hasattr(obj, k)],
+        "Value": [getattr(obj, k) for k in keys if hasattr(obj, k)]
+    }
+    df = pd.DataFrame(data)
+    
+    full_path = _output_path(savepath, config, "tables")
+    
+    # Special handling for training config
+    if "traincfg" in savepath.lower() or "train" in savepath.lower():
+        _save_train_config_latex(obj, full_path)
+    else:
+        save_dataframe_latex(df, full_path, caption=title, label=f"tab:{Path(savepath).stem}")
+
+def _save_train_config_latex(cfg, savepath):
+    """Save training config in specific LaTeX format."""
+    os.makedirs(os.path.dirname(savepath) or ".", exist_ok=True)
+    
+    def fmt_sci(x):
+        """Format number as LaTeX scientific notation if small."""
+        if isinstance(x, (int, float)):
+            if x >= 1e-2:
+                return f"{x:.2g}"
+            exp = int(np.floor(np.log10(x)))
+            coeff = x / (10 ** exp)
+            if abs(coeff - int(coeff)) < 1e-6:
+                return f"${int(coeff)}\\times 10^{{{exp}}}$"
+            return f"${coeff:.1f}\\times 10^{{{exp}}}$"
+        return str(x)
+    
+    epochs_sup = getattr(cfg, 'sup_epochs', 1)
+    epochs_unsup = getattr(cfg, 'unsup_epochs', 5)
+    steps = getattr(cfg, 'unsup_n_steps', 70)
+    horizon = getattr(cfg, 'horizon', 30)
+    lr = getattr(cfg, 'unsup_lr', 5e-4)
+    lambda_sup = getattr(cfg, 'lambda_sup_base', 0.5)
+    batch_size = getattr(cfg, 'batch_size', None)
+    batch_size_str = str(int(batch_size)) if batch_size is not None else "None"
+    
+    with open(savepath, "w", encoding="utf-8") as f:
+        f.write("\\begin{tabular}{@{}ccccccc@{}}\n")
+        f.write("\\toprule\n")
+        f.write("$E_{\\mathrm{sup}}$ & $E_{\\mathrm{unsup}}$ & $S_{\\mathrm{unsup}}$ & $h$ & $\\lambda_{\\text{sup}}$ & $\\mu$ & $|\\mathcal{B}|$  \\\\\n")
+        f.write("\\midrule\n")
+        f.write(f"{epochs_sup} & {epochs_unsup} & {steps} & {horizon} & {lambda_sup} & {fmt_sci(lr)} & {batch_size_str}  \\\\\n")
+        f.write("\\bottomrule\n")
+        f.write("\\end{tabular}\n")
+
+
+def show_monte_carlo_results(results_dict, controller_name="Controller", title=None):
+    """
+    Display Monte Carlo evaluation results in a nice formatted table.
+    
+    Parameters
+    ----------
+    results_dict : dict or dict of dicts
+        Output from simulation.monte_carlo() - can be single controller or multiple
+    controller_name : str, optional
+        Name if single controller (ignored if results_dict contains multiple)
+    title : str, optional
+        Title for the table
+    """
+    import numpy as np
+    
+    # Check if this is a dict of results (multiple controllers)
+    if isinstance(results_dict, dict) and 'X0_pool' not in results_dict:
+        # Multiple controllers - create comparison table
+        rows = []
+        for name, res in results_dict.items():
+            rows.append(_compute_monte_carlo_stats(res, name))
+        
+        df = pd.DataFrame(rows)
+    else:
+        # Single controller
+        df = _compute_monte_carlo_stats(results_dict, controller_name)
+        df = pd.DataFrame([df])
+    
+    if title:
+        display(Markdown(f"**{title}**"))
+    
+    display(df.style.hide(axis="index").set_table_styles([
+        {'selector': 'th', 'props': [('background-color', '#f4f4f4'), ('color', 'black'), ('font-weight', 'bold')]}
+    ]))
+    
+    return df
+
+def _compute_monte_carlo_stats(results_dict, controller_name):
+    """Helper to compute stats for a single controller."""
+    import numpy as np
+    
+    init_dists = np.asarray(results_dict['init_dists'])
+    final_dists = np.asarray(results_dict['final_dists'])
+    NN_final_times = np.asarray(results_dict['NN_final_times'])
+    NN_costs = np.asarray(results_dict['NN_costs'])
+    
+    converged_mask = np.isfinite(NN_final_times)
+    n_converged = np.sum(converged_mask)
+    n_total = len(NN_final_times)
+    stability = n_converged / n_total if n_total > 0 else 0.0
+    
+    return {
+        "Controller": controller_name,
+        "Stability (S)": f"{stability:.1%}",
+      #  "Converged / Total": f"{n_converged} / {n_total}",
+      #  "Initial ||X|| (mean)": f"{np.mean(init_dists):.4f}",
+        "Final ||X|| (mean)": f"{np.mean(final_dists[converged_mask]):.4f}" if n_converged > 0 else "N/A",
+        "t_conv (mean)": f"{np.mean(NN_final_times[converged_mask]):.2f}" if n_converged > 0 else "N/A",
+        "Cost J (mean)": f"{np.mean(NN_costs[converged_mask]):.4f}" if n_converged > 0 else "N/A"
+    }
+
+
+def save_monte_carlo_results(results_dict, controller_name="Controller", config=None, 
+                            savepath="monte_carlo.tex"):
+    """Save Monte Carlo results to LaTeX table with format: Model | Stability S | t_conv (mean) | Cost J (mean)."""
+    import numpy as np
+    
+    if isinstance(results_dict, dict) and 'X0_pool' not in results_dict:
+        rows = []
+        for name, res in results_dict.items():
+            rows.append(_compute_monte_carlo_stats_latex(res, name))
+        df = pd.DataFrame(rows)
+    else:
+        stats = _compute_monte_carlo_stats_latex(results_dict, controller_name)
+        df = pd.DataFrame([stats])
+    
+    full_path = _output_path(savepath, config, "tables")
+    _save_monte_carlo_latex(df, full_path)
+    return df
+
+def _save_monte_carlo_latex(df, savepath):
+    """Save Monte Carlo table in specific LaTeX format with toprule/midrule/bottomrule."""
+    os.makedirs(os.path.dirname(savepath) or ".", exist_ok=True)
+    
+    def fmt_stability(x):
+        if isinstance(x, (float, np.floating)) and not np.isnan(x):
+            return f"{x*100:.1f}\\%"
+        return "N/A"
+    
+    def fmt_float(x, decimals=2):
+        if isinstance(x, (float, np.floating)) and not np.isnan(x):
+            return f"{x:.{decimals}f}"
+        return "N/A"
+    
+    def escape_tex(s):
+        return str(s).replace("_", "\\_").replace("%", "\\%").replace("&", "\\&")
+    
+    with open(savepath, "w", encoding="utf-8") as f:
+        f.write("\\begin{tabular}{lrrr}\n")
+        f.write("\\toprule\n")
+        f.write("Model & Stability $S$ & $t_{\\text{conv}}$ (mean)  & Cost $J$ (mean) \\\\\n")
+        f.write("\\midrule\n")
+        
+        for _, row in df.iterrows():
+            model = escape_tex(row["Model"])
+            stability = fmt_stability(row["Stability $S$"])
+            t_conv = fmt_float(row["$t_{\\text{conv}}$ (mean)"], decimals=2)
+            cost = fmt_float(row["Cost $J$ (mean)"], decimals=4)
+            f.write(f"{model} & {stability}  & {t_conv}  & {cost} \\\\\n")
+        
+        f.write("\\bottomrule\n")
+        f.write("\\end{tabular}\n")
+
+def _compute_monte_carlo_stats_latex(results_dict, controller_name):
+    """Helper for LaTeX formatting - returns only Model, Stability S, t_conv (mean), Cost J (mean)."""
+    import numpy as np
+    
+    NN_final_times = np.asarray(results_dict['NN_final_times'])
+    NN_costs = np.asarray(results_dict['NN_costs'])
+    
+    converged_mask = np.isfinite(NN_final_times)
+    n_converged = np.sum(converged_mask)
+    n_total = len(NN_final_times)
+    stability = n_converged / n_total if n_total > 0 else 0.0
+    
+    t_conv_mean = np.mean(NN_final_times[converged_mask]) if n_converged > 0 else np.nan
+    cost_mean = np.mean(NN_costs[converged_mask]) if n_converged > 0 else np.nan
+    
+    return {
+        "Model": controller_name,
+        "Stability $S$": stability,
+        "$t_{\\text{conv}}$ (mean)": t_conv_mean,
+        "Cost $J$ (mean)": cost_mean
+    }

@@ -1,0 +1,17 @@
+\begin{table}
+\caption{Perturbation robustness: controllers trained on baseline Allen-Cahn, evaluated on perturbed variants.}
+\label{tab:ac-robustness}
+\begin{tabular}{lllllll}
+\toprule
+Controller & Advection (c=0.05) Stab. & Advection (c=0.05) Cost & Advection (c=0.10) Stab. & Advection (c=0.10) Cost & Advection (c=0.12) Stab. & Advection (c=0.12) Cost \\
+\midrule
+LQR & 100% & 0.54 & 100% & 0.49 & 100% & 0.50 \\
+GradQRNet & 72% & 0.63 & 73% & 0.52 & 66% & 0.58 \\
+GradQRNet (sup) & 7% & 0.03 & 7% & 0.03 & 8% & 0.03 \\
+GradQRNet (pre) & 100% & 0.57 & 100% & 0.52 & 100% & 0.53 \\
+GradQRNet (pre/sup) & 0% & — & 0% & — & 0% & — \\
+GradQRNet (ad) & 100% & 0.55 & 100% & 0.49 & 100% & 0.51 \\
+GradQRNet (sup/ad) & 100% & 0.55 & 100% & 0.49 & 100% & 0.51 \\
+\bottomrule
+\end{tabular}
+\end{table}

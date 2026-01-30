@@ -4,6 +4,15 @@ __pycache__/
 *.pyd
 .pytest_cache/
 .mypy_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+.env
+.env.*
 
 ## macOS
 .DS_Store
@@ -21,8 +30,9 @@ cache_seed*/**
 cache_hard_ics/
 saved_models/
 figures/
-thesis/tables/
-thesis/figures/
+
+## Generated outputs (experiments/results/{system}/seed_{seed}/)
+experiments/results/
 
 ## Model checkpoints (also in results/)
 *.pt

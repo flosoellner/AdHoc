@@ -14,7 +14,7 @@ class TrainConfig:
     sup_n_steps: int = None
     sup_lr: float = 1e-5 # 
     unsup_epochs: int = 5
-    unsup_n_steps: int = 70 # burgers: 30, allen_cahn: 100
+    unsup_n_steps: int = 30 # burgers: 30, allen_cahn: 100
     unsup_lr: float = 5e-4 # 
     batch_size: int = None
     device: str = "cpu"
@@ -27,13 +27,13 @@ class TrainConfig:
     adaptive_D0: float = 0.0              # threshold for heuristic
     adaptive_C: float = 0.0002                    # heuristic scaling
     adaptive_M: float = 1.3                  # batch growth multiplier
-    # Horizon growth
-    horizon_initial: int = 30    # burgers: 250, allen_cahn: 25 # initial rollout horizon
-    horizon_max: int = 4000                  # maximum horizon (never exceed)
-    horizon_growth_factor: float = 1.00      # multiply horizon by this each epoch (1.0 = no growth)
+    # Rollout horizon
+    horizon: int = 250  # burgers: 250, allen_cahn: 25
     # Loss weighting
     lambda_sup_base: float = 0.5            # Base supervised penalty weight (decays to 0)
     sup_err_scale: float = 10.0             # Scale factor for supervised MSE to match HJB magnitude
+    # Adaptive sampling method
+    adaptive_sampling: str = "gradient"     # "gradient" (gradient residual) or "hjb" (HJB residual norm)
 
 
 from controls.model_factory import save_model, load_gradnet, train_or_load_gradnet
@@ -182,6 +182,9 @@ def train_loop(
 
     from sampling import sample_conditions, adaptive_sample_conditions
 
+    # Get adaptive sampling method from config or default to "gradient"
+    adaptive_sampling = getattr(cfg, 'adaptive_sampling', 'gradient')
+
     if adaptive:
         if cfg.batch_size is None:
             raise ValueError("adaptive=True requires cfg.batch_size to be set")
@@ -195,7 +198,8 @@ def train_loop(
     def sample_X():
         if not adaptive:
             return sample_conditions(config, cfg.batch_size)  # (d,B)
-        X_np, _ = adaptive_sample_conditions(config, cfg.batch_size, controller=model)
+
+        X_np, _ = adaptive_sample_conditions(config, cfg.batch_size, controller=model, device=cfg.device)
         return X_np
 
     sup_iter = itertools.cycle(sup_loader) if (sup_loader is not None) else None
@@ -221,12 +225,6 @@ def train_loop(
         n = 0
         gnorms = []
 
-        # Compute horizon for this epoch (exponentially grow)
-        current_horizon = min(
-            int(cfg.horizon_initial * (cfg.horizon_growth_factor ** (ep - 1))),
-            cfg.horizon_max
-        )
-
         for step_i in range(cfg.unsup_n_steps):
             # Compute lambda_sup: smooth linear decay from lambda_sup_base to 0
             progress = global_step / total_steps  # 0 to 1 over all steps
@@ -242,7 +240,7 @@ def train_loop(
             # unsupervised loop - use normalized lambdas
             loss, hjb_err, dpc_err, sup_err = loss_fn(
                 model, (X,), mode=mode, supervision=False, 
-                horizon=current_horizon, lambda_hjb=lambda_hjb_norm,
+                horizon=cfg.horizon, lambda_hjb=lambda_hjb_norm,
                 sup_err_scale=cfg.sup_err_scale
             )
 
@@ -253,7 +251,7 @@ def train_loop(
                 # Get supervised MSE error (HJB already computed in main loss)
                 _, _, _, sup_only = loss_fn(
                     model, (Xs, Gs), mode=mode, supervision=True, 
-                    horizon=current_horizon, lambda_hjb=lambda_hjb_norm, lambda_sup=lambda_sup_norm,
+                    horizon=cfg.horizon, lambda_hjb=lambda_hjb_norm, lambda_sup=lambda_sup_norm,
                     sup_err_scale=cfg.sup_err_scale
                 )
                 # Only add the supervised MSE penalty: lambda_sup_norm * sup_err_scale * sup_err
@@ -329,18 +327,11 @@ def train_loop(
 
 
 
-from problems.burgers import BurgersPhysics
-from problems.allen_cahn import AllenCahnPhysics
-
 def _physics(model, X):
+    """Get torch physics module from OCP (single source: ocp.physics_module())."""
     if not hasattr(model, "_physics"):
         ocp = model.config.ocp
-        if model.config.system == "burgers":
-            model._physics = BurgersPhysics(ocp).to(device=X.device, dtype=X.dtype)
-        elif model.config.system == "allen_cahn":
-            model._physics = AllenCahnPhysics(ocp).to(device=X.device, dtype=X.dtype)
-        else:
-            raise ValueError(f"Unknown system: {model.config.system}")
+        model._physics = ocp.physics_module().to(device=X.device, dtype=X.dtype)
     return model._physics
 
 
@@ -412,7 +403,7 @@ def loss_unified(
 
         # dt parameters: small when far, large when close
         dt_min = 0.00000001
-        dt_max = 0.4 # burgers: 0.1, allen_cahn: 0.05
+        dt_max = 0.1 # burgers: 0.1, allen_cahn: 0.05
         convergence_threshold = 0.01 # burgers: 0.0005, allen_cahn: ?
 
         for step in range(horizon):

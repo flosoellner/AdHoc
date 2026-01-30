@@ -1,65 +1,22 @@
 import numpy as np
 
+
 def sample_conditions(config, n: int, dist: float = None, seed: int = None, K: int = 10):
     """
-    Sample initial conditions using sum of sine functions.
-    
-    Parameters:
-    -----------
-    config : MakeOCP instance or config-like object
-        Must have: n_states (or d), xi (Chebyshev nodes), w (weights for norm)
-    n : int
-        Number of samples to generate
-    seed : int, optional
-        Random seed for reproducibility
-    dist : float, optional
-        If provided, normalize samples to this distance from origin
-        
-    Returns:
-    --------
-    X0 : array, shape (n, d)
-        Initial conditions, one per row
+    Sample n initial conditions via config.ocp.sample_initial_conditions;
+    optionally normalize to dist. K is passed through for problems that use it
+    (e.g. Fourier modes).
     """
-    if seed is not None:
-        np.random.seed(seed)
+    ocp = config.ocp
+    X0 = ocp.sample_initial_conditions(n, seed=seed, K=K)
 
-
-
-    K = 10 # number of sine modes
-    d = int(config.n_states)
-    
-    # Get xi (Chebyshev nodes) - may be on ocp or config
-    xi = config.xi
-
-    xi = xi.flatten()
-    xi_pi = np.pi * xi  # Use pi * xi for sine functions
-    
-
-    # Generate samples: X0 = sum_{k=1}^10 a_k * sin(k * pi * xi), a_k ~ U[-1/k, 1/k]
-    X0 = np.zeros((d, n))
-    if config.system == "burgers":
-        for k in range(1, K + 1):
-            # Use sine for Dirichlet BC (Burgers)
-            ak = (2.0 * np.random.rand(1, n) - 1.0) / float(k)
-            X0 += ak * np.sin(k * xi_pi).reshape(d, 1)
-    elif config.system == "allen_cahn":
-        for k in range(1, K+1):
-            ak = (2*np.random.rand(1, n) - 1) / k
-            X0 += ak * np.cos(k * np.pi * xi).reshape(d,1)
-    
-    # Normalize to dist if requested
-    # Note: norm_func now computes distance from X_bar by default (was distance from zero)
-    # For Burgers (X_bar=0), behavior is unchanged. For Allen-Cahn (X_bar=-1), 
-    # samples are normalized to distance from target state, which is more appropriate.
     if dist is not None:
         norm_func = config.norm
+        X0_norm = norm_func(X0).reshape(1, -1)
+        X0 = X0 * (float(dist) / (X0_norm + 1e-12))
 
-        X0_norm = norm_func(X0).reshape(1, -1)  # Now computes ||X0 - X_bar|| by default
-        X0 *= float(dist) / (X0_norm + 1e-12)
+    return X0  # (d, n)
 
-    
-    # Return as (n, d)
-    return X0
 
 
 

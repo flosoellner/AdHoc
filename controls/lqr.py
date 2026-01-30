@@ -16,8 +16,15 @@ class LQR:
             self.P = np.asarray(P)
         else:
             self.P = care(A, B, Q, R)
-        self.RB = np.linalg.solve(R, np.transpose(B))
-        self.K = np.matmul(self.RB, self.P)
+        
+        # Handle B=0 case (uncontrollable system)
+        if np.allclose(B, 0):
+            # When B=0, RB and K should be zero matrices
+            self.RB = np.zeros((B.shape[1], B.shape[0]))  # (n_controls, n_states)
+            self.K = np.zeros((B.shape[1], A.shape[0]))     # (n_controls, n_states)
+        else:
+            self.RB = np.linalg.solve(R, np.transpose(B))
+            self.K = np.matmul(self.RB, self.P)
 
     def eval_V(self, X):
         '''Value function V(X) = (X - X_bar)^T P (X - X_bar)'''
