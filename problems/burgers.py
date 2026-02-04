@@ -5,13 +5,14 @@ from controls.lqr import LQR
 
 
 def get_default_config():
-    """Burgers system-specific default config (n_states, n_controls, time, solver, etc.)."""
+    """Burgers system-specific default config (n_states, n_controls, time, solver, nu, etc.)."""
     return {
         "n_states": 32,
         "n_controls": 2,
         "t1_initial": 15.0,
         "t1_scale": 6 / 5,
         "t1_max": 60.0,
+        "nu": 0.012,
         "ocp_solver": "indirect",
         "direct_n_init_nodes": 50,
         "indirect_tol": 1e-3,
@@ -53,8 +54,8 @@ class BurgersOCP(BaseOCP):
     def __init__(self, config):
         n_states = config.n_states
         n_controls = config.n_controls
-        # Burgers-specific parameters
-        self.nu = 0.012  # 0.01= hard, 0.02=easy
+        # Burgers-specific parameters (nu can be overridden for scalability / mismatch evaluation)
+        self.nu = getattr(config, "nu", 0.012)
         self.gamma = 0.1
         self.R = 0.5
         kappa = 25.0

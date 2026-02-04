@@ -255,6 +255,34 @@ def _build_dirichlet_operators(n_states: int):
     return xi, D, D2, D3, w_flat, w
 
 
+def _build_full_grid_operators(n_states: int):
+    """
+    Build Chebyshev operators on the full grid on [0, 1] (including boundaries).
+    Grid: xi[0] = 0, xi[-1] = 1. Scale: d/dxi = 2 * d/dz with z in [-1, 1].
+    Returns xi, D, D2, D3, D4, w_flat, w for use with Robin/nonlinear BCs.
+    """
+    # cheb(N) returns N+1 points; we want n_states points so use cheb(n_states - 1)
+    N = n_states
+    x_nodes, D_z, w_z = cheb(N - 1)
+    # x_nodes: [1, ..., -1] (first is right, last is left in [-1,1])
+    # Map to [0,1] with xi[0]=0, xi[-1]=1: reverse and scale xi = (z+1)/2
+    xi = (x_nodes[::-1] + 1.0) / 2.0
+    xi = xi.reshape(-1, 1)
+    # Reverse differentiation matrices and scale: d/dxi = 2 * d/dz
+    P = np.eye(N)[::-1]  # reversal permutation
+    D_z_rev = P @ D_z @ P.T
+    D = 2.0 * D_z_rev
+    D2_z = D_z @ D_z
+    D3_z = D_z @ D2_z
+    D4_z = D2_z @ D2_z
+    D2 = 4.0 * (P @ D2_z @ P.T)
+    D3 = 8.0 * (P @ D3_z @ P.T)
+    D4 = 16.0 * (P @ D4_z @ P.T)
+    w_flat = (w_z[::-1] / 2.0)
+    w = w_flat.reshape(-1, 1)
+    return xi, D, D2, D3, D4, w_flat, w
+
+
 def _default_control_matrix(n_states: int, n_controls: int) -> np.ndarray:
     """
     Default uniform-identity control matrix: split state indices evenly across

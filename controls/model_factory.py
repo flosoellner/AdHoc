@@ -14,20 +14,20 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "adaptive": False,
         "supervision": None,
     },
-    "GradNet (sup)": {
-        "enabled": False,
-        "kind": "gradnet",
-        "use_lqr": False,
-        "train_mode": "unsupervised",
-        "adaptive": False,
-        "supervision": True,
-    },
 
     "GradQRNet": {
         "enabled": False,
         "kind": "gradnet",
         "use_lqr": True,
         "train_mode": "unsupervised",
+        "adaptive": False,
+        "supervision": None,
+    },
+    "Sup GradQRNet": {
+        "enabled": False,
+        "kind": "gradnet",
+        "use_lqr": True,
+        "train_mode": "supervised",
         "adaptive": False,
         "supervision": None,
     },
@@ -40,22 +40,6 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "supervision": True,
     },
 
-    "GradNet (pre)": {
-        "enabled": False,
-        "kind": "gradnet",
-        "use_lqr": False,
-        "train_mode": "hybrid",
-        "adaptive": False,
-        "supervision": None,
-    },
-    "GradNet (pre/sup)": {
-        "enabled": False,
-        "kind": "gradnet",
-        "use_lqr": False,
-        "train_mode": "hybrid",
-        "adaptive": False,
-        "supervision": True,
-    },
 
     "GradQRNet (pre)": {
         "enabled": False,
@@ -74,14 +58,6 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "supervision": True,
     },
 
-    "GradNet (ad)": {
-        "enabled": False,
-        "kind": "gradnet",
-        "use_lqr": False,
-        "train_mode": "unsupervised",
-        "adaptive": True,
-        "supervision": None,
-    },
     "GradNet (sup/ad)": {
         "enabled": False,
         "kind": "gradnet",
@@ -104,23 +80,6 @@ DEFAULT_CONTROLLER_CONFIGS = {
         "kind": "gradnet",
         "use_lqr": True,
         "train_mode": "unsupervised",
-        "adaptive": True,
-        "supervision": True,
-    },
-
-    "GradNet (pre/ad)": {
-        "enabled": False,
-        "kind": "gradnet",
-        "use_lqr": False,
-        "train_mode": "hybrid",
-        "adaptive": True,
-        "supervision": None,
-    },
-    "GradNet (pre/sup/ad)": {
-        "enabled": False,
-        "kind": "gradnet",
-        "use_lqr": False,
-        "train_mode": "hybrid",
         "adaptive": True,
         "supervision": True,
     },
@@ -172,9 +131,11 @@ def save_model(path, *, config, grad_net=None, value_net=None, extra=None, histo
     # Save phase information if present (for hybrid models)
     if history is not None and "phase" in history:
         history_to_save["phase"] = list(history["phase"])
-    # Save val_mse if present
+    # Save val_mse and n_sup_epochs if present
     if history is not None and "val_mse" in history:
         history_to_save["val_mse"] = list(history["val_mse"])
+    if history is not None and "n_sup_epochs" in history:
+        history_to_save["n_sup_epochs"] = int(history["n_sup_epochs"])
     ckpt["history"] = history_to_save
     torch.save(ckpt, path)
 
@@ -204,9 +165,11 @@ def load_gradnet(path, *, config, device="cpu"):
         # Restore phase information if present (check original dict)
         if "phase" in hist_orig:
             hist["phase"] = np.asarray(hist_orig["phase"])
-        # Restore val_mse if present (check original dict)
+        # Restore val_mse and n_sup_epochs if present (check original dict)
         if "val_mse" in hist_orig:
             hist["val_mse"] = np.asarray(hist_orig["val_mse"])
+        if "n_sup_epochs" in hist_orig:
+            hist["n_sup_epochs"] = int(hist_orig["n_sup_epochs"])
     return grad_net, ckpt.get("meta", {}), hist
 
 
@@ -219,20 +182,22 @@ def train_or_load_gradnet(
     adaptive: bool = False, 
     supervision: bool | None = False,
     train_loader=None,
-    val_loader=None,  # NEW: validation loader
+    val_loader=None,
     train_cfg,
     ckpt_dir: str = None,
     force_retrain: bool = False,
     device: str = "cpu",
     data=None,
-    val_data=None,  # NEW: validation data dict
+    val_data=None,
 ):
     from controls.train import train_loop, loss_unified, make_loader_XG
     from problems import get_results_dir
     
     if supervision is None:
         supervision = False
-    
+    if getattr(train_cfg, "batch_size", None) is None:
+        train_cfg.batch_size = config.n_states
+
     if ckpt_dir is None:
         ckpt_dir = get_results_dir(config, "saved_models")
     
@@ -274,7 +239,7 @@ def train_or_load_gradnet(
             loss_unified,
             sup_cfg,
             mode="supervised",
-            val_loader=val_loader_actual,  # NEW
+            val_loader=val_loader_actual,
         )
 
     elif train_mode == "unsupervised":
@@ -296,7 +261,7 @@ def train_or_load_gradnet(
             grad_net, None, loss_unified, unsup_cfg,
             mode="unsupervised", config=config, adaptive=adaptive,
             supervision=supervision, sup_loader=sup_loader, sup_every=1,
-            val_loader=val_loader_actual,  # NEW
+            val_loader=val_loader_actual,
         )
         
         # Offset so unsupervised-only ends at expected_total_iters (same as hybrid)
@@ -320,7 +285,7 @@ def train_or_load_gradnet(
             loss_unified,
             sup_cfg,
             mode="supervised",
-            supervision=supervision,  # NEW: pass supervision parameter
+            supervision=supervision,
             val_loader=val_loader_actual,
         )
         grad_net, hist_unsup = train_loop(
@@ -337,9 +302,6 @@ def train_or_load_gradnet(
             val_loader=val_loader_actual,
         )
 
-        # ... rest of existing code ...
-
-
         # Combine supervised and unsupervised histories
         it_sup, lo_sup = hist_sup["iters"], hist_sup["loss"]
         it_uns, lo_uns = hist_unsup["iters"], hist_unsup["loss"]
@@ -351,12 +313,13 @@ def train_or_load_gradnet(
             "phase": np.array((["sup"] * len(it_sup)) + (["unsup"] * len(it_uns))),
         }
         
-        # Add validation MSE if available
+        # Add validation MSE if available (and n_sup_epochs so val_mse plot can show unsup only)
         if "val_mse" in hist_sup:
             val_mse_sup = hist_sup["val_mse"]
             val_mse_unsup = hist_unsup.get("val_mse", [])
             if len(val_mse_unsup) > 0:
                 history["val_mse"] = np.concatenate([val_mse_sup, val_mse_unsup])
+                history["n_sup_epochs"] = len(val_mse_sup)
             else:
                 history["val_mse"] = val_mse_sup
 
@@ -377,7 +340,7 @@ def train_controllers_from_config(
     config,
     train_cfg,
     data=None,
-    val_data=None,  # NEW: validation data
+    val_data=None,
     device="cpu",
     verbose=True,
 ):
@@ -441,7 +404,7 @@ def train_controllers_from_config(
             supervision=cfg["supervision"],
             train_cfg=train_cfg,
             data=data,
-            val_data=val_data,  # NEW: pass validation data
+            val_data=val_data,
             device=device,
         )
         
@@ -463,7 +426,7 @@ def train_controllers(
     config,
     train_cfg,
     data=None,
-    val_data=None,  # NEW: validation data
+    val_data=None,
     controller_configs=None,
     device="cpu",
     verbose=True,
@@ -516,7 +479,7 @@ def train_controllers(
         config=config,
         train_cfg=train_cfg,
         data=data,
-        val_data=val_data,  # NEW: pass validation data
+        val_data=val_data,
         device=device,
         verbose=verbose,
     )

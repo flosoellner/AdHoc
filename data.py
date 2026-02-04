@@ -12,11 +12,10 @@ _headers = (
     '-----------------------------------'
 )
 
-n_candidates = 200 # burgers: 200
-
 def generate(
         OCP, config, n_trajectories, controller=None, resolve_failed=True,
-        verbose=0, suppress_warnings=True, adaptive_sampling="gradient"
+        verbose=0, suppress_warnings=True, adaptive_sampling="gradient",
+        n_candidates=None
     ):
     '''
     Generate data for an OCP by solving n_trajectories open loop OCPs. Uses LQR
@@ -69,6 +68,8 @@ def generate(
     fail_time : float
         Total time of failed solution attempts in seconds
     '''
+    if n_candidates is None:
+        raise ValueError("n_candidates must be set by the experiment (e.g. n_candidates=200)")
     data = {}
 
     events = OCP.make_integration_events()
@@ -76,13 +77,12 @@ def generate(
     def open_converged(X, U):
         return OCP.running_cost(X, U) < config.fp_tol
 
-    # Eikonal (Section 3.2 & 4.3): uniform x0 in [-1,1] only. Others: adaptive sampling.
     sampling_controller = OCP.LQR
 
     X0_pool, _ = sampling.adaptive_sample_conditions(
         config, n_trajectories,
         controller=sampling_controller,
-        n_candidates=n_candidates, # burgers: 200
+        n_candidates=n_candidates,
         seed=config.seed
     )
     if X0_pool.shape[0] != OCP.n_states:
@@ -100,7 +100,8 @@ def generate(
         else:
             X0_additional, _ = sampling.adaptive_sample_conditions(
                 config, n_needed, controller=sampling_controller,
-                n_candidates=n_candidates, seed=None
+                n_candidates=n_candidates,
+                seed=None
             )
         if X0_additional.shape[0] != OCP.n_states:
             X0_additional = X0_additional.T
@@ -149,7 +150,7 @@ def generate(
                 X0_additional, _ = sampling.adaptive_sample_conditions(
                     config, n_needed,
                     controller=sampling_controller,
-                    n_candidates=n_candidates, # burgers: 5
+                    n_candidates=n_candidates,
                     seed=None
                 )
                 if X0_additional.shape[0] != OCP.n_states:
@@ -339,7 +340,11 @@ def _fingerprint(config, n_trajectories, controller, adaptive_sampling="gradient
 
 
 
-def load_or_generate(config, n_trajectories, *, controller=None, cache_dir=None, force_regen=False, val_split=0.2, adaptive_sampling="gradient", **kwargs):
+def load_or_generate(config, n_trajectories=None, *, controller=None, cache_dir=None, force_regen=False, val_split=0.2, adaptive_sampling="gradient", n_candidates=None, **kwargs):
+    if n_trajectories is None:
+        raise ValueError("n_trajectories must be set by the experiment (e.g. n_trajectories=500)")
+    if n_candidates is None:
+        raise ValueError("n_candidates must be set by the experiment (e.g. n_candidates=200)")
     if cache_dir is None:
         from problems import get_results_dir
         cache_dir = get_results_dir(config, "data")
@@ -358,11 +363,11 @@ def load_or_generate(config, n_trajectories, *, controller=None, cache_dir=None,
         meta_loaded = json.loads(str(z_train["__meta__"]))
         return dataset_train, dataset_val, meta_loaded
 
-    # Generate data
     dataset, n_attempt, n_fail, sol_time, fail_time = generate(
         config.ocp, config, n_trajectories,
         controller=controller,
         adaptive_sampling=adaptive_sampling,
+        n_candidates=n_candidates,
         **kwargs
     )
 

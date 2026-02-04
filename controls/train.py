@@ -24,16 +24,21 @@ class TrainConfig:
     bs_max: int = 256
     adaptive_init_frac: float = 1.0           # initial batch = ceil(nominal * frac)
     adaptive_bs_max_factor: float = 1.0        # max batch = factor * initial batch (adaptive=True)
-    adaptive_D0: float = 0.0              # threshold for heuristic
-    adaptive_C: float = 0.0002                    # heuristic scaling
-    adaptive_M: float = 1.3                  # batch growth multiplier
+    adaptive_D0: float = 0.0
+    adaptive_C: float = 0.0002
+    adaptive_M: float = 1.0                  # batch growth multiplier
     # Rollout horizon
     horizon: int = 250  # burgers: 250, allen_cahn: 25
+    # Rollout integration (unsupervised HJB rollout)
+    dt_min: float = 1e-8
+    dt_max: float = 0.1  # burgers: 0.1, allen_cahn: 0.05
+    convergence_threshold: float = 0.01  # burgers: 0.0005, allen_cahn: tune per system
     # Loss weighting
     lambda_sup_base: float = 0.5            # Base supervised penalty weight (decays to 0)
     sup_err_scale: float = 10.0             # Scale factor for supervised MSE to match HJB magnitude
     # Adaptive sampling method
     adaptive_sampling: str = "gradient"     # "gradient" (gradient residual) or "hjb" (HJB residual norm)
+    n_candidates: int | None = None
 
 
 from controls.model_factory import save_model, load_gradnet, train_or_load_gradnet
@@ -78,7 +83,7 @@ def train_loop(
     mode: str = None,
     config=None,
     adaptive: bool = False,
-    supervision: bool | None = None,  # Add this parameter
+    supervision: bool | None = None,
     sup_loader=None,
     sup_every: int = 50,
     val_loader=None,
@@ -169,8 +174,8 @@ def train_loop(
 
             if (ep % cfg.log_every) == 0:
                 bs_disp = "None" if cfg.batch_size is None else str(int(cfg.batch_size))
-                val_str = f" | val_mse={val_mse:.2e}" if val_mse is not None else " | val_mse=nan"
-                print(f"epoch {ep:04d} | loss={sum_total/n:.2e} | hjb={sum_hjb/n:.2e} | sup={sum_sup/n:.2e} | bs={bs_disp} | heur=nan{val_str}")
+                val_str = f" | val_mse={val_mse:.2e}" if val_mse is not None else ""
+                print(f"epoch {ep:04d} | loss={sum_total/n:.2e} | hjb={sum_hjb/n:.2e} | sup={sum_sup/n:.2e} | bs={bs_disp}{val_str}")
 
         history = {"iters": np.asarray(iters), "loss": np.asarray(losses), "phase": np.asarray(phases)}
         if val_mses:
@@ -199,7 +204,10 @@ def train_loop(
         if not adaptive:
             return sample_conditions(config, cfg.batch_size)  # (d,B)
 
-        X_np, _ = adaptive_sample_conditions(config, cfg.batch_size, controller=model, device=cfg.device)
+        n_cand = getattr(cfg, "n_candidates", None)
+        if n_cand is None:
+            raise ValueError("TrainConfig.n_candidates must be set by the experiment (e.g. n_candidates=200)")
+        X_np, _ = adaptive_sample_conditions(config, cfg.batch_size, controller=model, device=cfg.device, n_candidates=n_cand)
         return X_np
 
     sup_iter = itertools.cycle(sup_loader) if (sup_loader is not None) else None
@@ -239,9 +247,12 @@ def train_loop(
 
             # unsupervised loop - use normalized lambdas
             loss, hjb_err, dpc_err, sup_err = loss_fn(
-                model, (X,), mode=mode, supervision=False, 
+                model, (X,), mode=mode, supervision=False,
                 horizon=cfg.horizon, lambda_hjb=lambda_hjb_norm,
-                sup_err_scale=cfg.sup_err_scale
+                sup_err_scale=cfg.sup_err_scale,
+                dt_min=getattr(cfg, "dt_min", 1e-8),
+                dt_max=getattr(cfg, "dt_max", 0.1),
+                convergence_threshold=getattr(cfg, "convergence_threshold", 0.01),
             )
 
             # optional supervised injection with decaying lambda_sup
@@ -250,9 +261,12 @@ def train_loop(
                 Xs = Xs.to(cfg.device); Gs = Gs.to(cfg.device)
                 # Get supervised MSE error (HJB already computed in main loss)
                 _, _, _, sup_only = loss_fn(
-                    model, (Xs, Gs), mode=mode, supervision=True, 
+                    model, (Xs, Gs), mode=mode, supervision=True,
                     horizon=cfg.horizon, lambda_hjb=lambda_hjb_norm, lambda_sup=lambda_sup_norm,
-                    sup_err_scale=cfg.sup_err_scale
+                    sup_err_scale=cfg.sup_err_scale,
+                    dt_min=getattr(cfg, "dt_min", 1e-8),
+                    dt_max=getattr(cfg, "dt_max", 0.1),
+                    convergence_threshold=getattr(cfg, "convergence_threshold", 0.01),
                 )
                 # Only add the supervised MSE penalty: lambda_sup_norm * sup_err_scale * sup_err
                 sup_penalty = lambda_sup_norm * cfg.sup_err_scale * sup_only
@@ -284,8 +298,6 @@ def train_loop(
             sum_sup   += float(sup_err.item()) * bs
             n += bs
 
-        # ... rest of existing code (validation, logging, etc.) ...
-
         g = np.asarray(gnorms, dtype=float)
         mu = float(np.mean(g)) if g.size else 0.0
         var = float(np.var(g)) if g.size else 0.0
@@ -294,7 +306,6 @@ def train_loop(
         if adaptive and (heuristic > float(cfg.adaptive_D0)):
             cfg.batch_size = min(int(cfg.batch_size * float(cfg.adaptive_M)), _bs_max_local)
 
-        # NEW: Compute validation MSE
         val_mse = None
         if val_loader is not None:
             model.eval()
@@ -314,11 +325,10 @@ def train_loop(
                 val_mses.append(val_mse)
             model.train()
 
-
-            if (ep % cfg.log_every) == 0:
-                bs_disp = "None" if cfg.batch_size is None else str(int(cfg.batch_size))
-                val_str = f" | val_mse={val_mse:.2e}" if val_mse is not None else " | val_mse=nan"
-                print(f"epoch {ep:04d} | loss={sum_total/n:.2e} | hjb={sum_hjb/n:.2e} | sup={sum_sup/n:.2e} | bs={bs_disp} | heur=nan{val_str}")
+        if (ep % cfg.log_every) == 0:
+            bs_disp = "None" if cfg.batch_size is None else str(int(cfg.batch_size))
+            val_str = f" | val_mse={val_mse:.2e}" if val_mse is not None else ""
+            print(f"epoch {ep:04d} | loss={sum_total/n:.2e} | hjb={sum_hjb/n:.2e} | sup={sum_sup/n:.2e} | bs={bs_disp}{val_str}")
 
     history = {"iters": np.asarray(iters), "loss": np.asarray(losses), "phase": np.asarray(phases)}
     if val_mses:
@@ -370,7 +380,9 @@ def loss_unified(
     lambda_sup: float = 0.0,  # Supervised penalty weight (normalized to sum with lambda_hjb to 1.0)
     sup_err_scale: float = 1.0,  # Scale factor for supervised MSE to match HJB magnitude
     horizon: int = None,
-    dt: float = 0.001,
+    dt_min: float = 1e-8,
+    dt_max: float = 0.1,
+    convergence_threshold: float = 0.01,
 ):
     X = batch[0]
     zero = X.new_tensor(0.0)
@@ -401,11 +413,7 @@ def loss_unified(
         if X_bar.ndim == 1:
             X_bar = X_bar.unsqueeze(0)
 
-        # dt parameters: small when far, large when close
-        dt_min = 0.00000001
-        dt_max = 0.1 # burgers: 0.1, allen_cahn: 0.05
-        convergence_threshold = 0.01 # burgers: 0.0005, allen_cahn: ?
-
+        # dt parameters: small when far, large when close (from cfg or kwargs)
         for step in range(horizon):
             # Compute distance to target X_bar
             x_err = x - X_bar

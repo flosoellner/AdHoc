@@ -32,13 +32,14 @@ def create_config(**overrides):
         system=overrides.get("system", default_system),
         fp_tol=overrides.get("fp_tol", default_fp_tol),
     )
+    # Apply overrides before attach so OCP is built with correct params (e.g. perturbation_type)
+    for k, v in overrides.items():
+        if k not in ("seed", "system", "fp_tol"):
+            setattr(config, k, v)
     attach = _REGISTRY.get(config.system)
     if attach is None:
         raise ValueError(f"Unknown system: {config.system!r}. Known: {list(_REGISTRY)}")
     attach(config, overrides)
-    for k, v in overrides.items():
-        if k not in ("seed", "system", "fp_tol"):
-            setattr(config, k, v)
     return config
 
 

@@ -18,25 +18,26 @@ def sample_conditions(config, n: int, dist: float = None, seed: int = None, K: i
     return X0  # (d, n)
 
 
-
-
 def adaptive_sample_conditions(
     config,
     n: int,
     *,
     controller,
-    n_candidates: int = 200,
+    n_candidates: int | None = None,
     dist: float | None = None,
     seed: int | None = None,
     device: str = "cpu",
 ):
     """
     Sample `n_candidates` using `sample_conditions`, score by ||dVdX - dVdX_LQR|| (residual), return top-n.
+    n_candidates must be set by the experiment.
 
     controller can be:
     - LQR: has .eval_dVdX(X) with X shaped (d,N) numpy
     - NN Control with GradNet: pass ctrl (has .grad_net torch module)
     """
+    if n_candidates is None:
+        raise ValueError("n_candidates must be set by the experiment (e.g. n_candidates=200)")
     Xcand = sample_conditions(config, n_candidates*n, seed=seed)  # (d,N)
 
     # get gradients (d,N)
