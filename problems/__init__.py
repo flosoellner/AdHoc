@@ -11,18 +11,19 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 from . import allen_cahn
 from . import burgers
-from . import kdv
+from . import kuramoto_sivashinsky
 # Registry: system name -> attach_config(config, overrides). Add new problems here.
 _REGISTRY = {
     "burgers": burgers.attach_config,
     "allen_cahn": allen_cahn.attach_config,
-    "kdv": kdv.attach_config,
+    "kuramoto_sivashinsky": kuramoto_sivashinsky.attach_config,
 }
 
 # Shared defaults (overridden by overrides or by attach_config defaults)
 default_system = "burgers"
-default_seed = 32
-default_fp_tol = 1e-02
+default_seed = 42
+default_fp_tol = 1e-2
+default_conv_tol = 1e-2
 
 
 def create_config(**overrides):
@@ -31,10 +32,11 @@ def create_config(**overrides):
         seed=overrides.get("seed", default_seed),
         system=overrides.get("system", default_system),
         fp_tol=overrides.get("fp_tol", default_fp_tol),
+        conv_tol=overrides.get("conv_tol", default_conv_tol),
     )
     # Apply overrides before attach so OCP is built with correct params (e.g. perturbation_type)
     for k, v in overrides.items():
-        if k not in ("seed", "system", "fp_tol"):
+        if k not in ("seed", "system", "fp_tol", "conv_tol"):
             setattr(config, k, v)
     attach = _REGISTRY.get(config.system)
     if attach is None:
@@ -52,4 +54,4 @@ def get_results_dir(config, subdir=None):
     return str(out)
 
 
-__all__ = ["create_config", "get_results_dir", "default_system", "default_seed", "default_fp_tol"]
+__all__ = ["create_config", "get_results_dir", "default_system", "default_seed", "default_fp_tol", "default_conv_tol"]

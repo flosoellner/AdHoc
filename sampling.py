@@ -1,14 +1,18 @@
 import numpy as np
+from typing import Optional
 
 
-def sample_conditions(config, n: int, dist: float = None, seed: int = None, K: int = 10):
+def sample_conditions(config, n: int, dist: float = None, seed: int = None, K: int = None):
     """
     Sample n initial conditions via config.ocp.sample_initial_conditions;
-    optionally normalize to dist. K is passed through for problems that use it
-    (e.g. Fourier modes).
+    optionally normalize to dist. K (Fourier modes) defaults to each OCP's own
+    default when None.
     """
     ocp = config.ocp
-    X0 = ocp.sample_initial_conditions(n, seed=seed, K=K)
+    kw = dict(seed=seed)
+    if K is not None:
+        kw["K"] = K
+    X0 = ocp.sample_initial_conditions(n, **kw)
 
     if dist is not None:
         norm_func = config.norm
@@ -23,9 +27,9 @@ def adaptive_sample_conditions(
     n: int,
     *,
     controller,
-    n_candidates: int | None = None,
-    dist: float | None = None,
-    seed: int | None = None,
+    n_candidates: Optional[int] = None,
+    dist: Optional[float] = None,
+    seed: Optional[int] = None,
     device: str = "cpu",
 ):
     """

@@ -50,7 +50,7 @@ def u_analytic(Vx: np.ndarray, config) -> np.ndarray:
 
     return u_optimal
 
-def find_fixed_point(OCP, controller, tol, X0=None, verbose=True):
+def find_fixed_point(OCP, controller, fp_tol, X0=None, verbose=True):
     '''
     Use root-finding to find a fixed point (equilibrium) of the closed-loop
     dynamics near the desired goal state OCP.X_bar. Also computes the
@@ -124,7 +124,7 @@ def find_fixed_point(OCP, controller, tol, X0=None, verbose=True):
 
     # Some linearized systems always have one or more zero eigenvalues.
     # Handle this situation by taking the next largest.
-    if np.abs(max_eig.real) < tol**2:
+    if np.abs(max_eig.real) < fp_tol**2:
         Jac0 = np.squeeze(OCP.closed_loop_jacobian(OCP.X_bar, OCP.LQR))
         eigs0 = np.linalg.eigvals(Jac0)
         idx = np.argsort(eigs0.real)
@@ -134,8 +134,8 @@ def find_fixed_point(OCP, controller, tol, X0=None, verbose=True):
         i = 2
         while all([
                 i <= OCP.n_states,
-                np.abs(max_eig.real) < tol**2,
-                np.abs(max_eig0.real) < tol**2
+                np.abs(max_eig.real) < fp_tol**2,
+                np.abs(max_eig0.real) < fp_tol**2
             ]):
             max_eig = np.squeeze(eigs[OCP.n_states - i])
             max_eig0 = np.squeeze(eigs0[OCP.n_states - i])
@@ -144,7 +144,7 @@ def find_fixed_point(OCP, controller, tol, X0=None, verbose=True):
     if verbose:
         s = '||actual - desired_equilibrium|| = {norm:1.2e}'
         print(s.format(norm=X_star_err))
-        if np.max(np.abs(F_star)) > tol:
+        if np.max(np.abs(F_star)) > fp_tol:
             print('Dynamics f(X_star):')
             print(F_star)
         s = 'Largest Jacobian eigenvalue = {real:1.2e} + j{imag:1.2e} \n'
@@ -255,6 +255,52 @@ def _build_dirichlet_operators(n_states: int):
     return xi, D, D2, D3, w_flat, w
 
 
+def _build_fourier_operators(n_states: int, L: float = 2 * np.pi):
+    """
+    Build Fourier spectral differentiation matrices on [0, L) with periodic BC.
+
+    Parameters
+    ----------
+    n_states : int
+        Number of equispaced grid points (must be even for clean FFT symmetry).
+    L : float
+        Domain length (default 2*pi).
+
+    Returns
+    -------
+    xi : (n,1) array – grid points on [0, L).
+    D  : (n,n) array – first derivative matrix.
+    D2 : (n,n) array – second derivative matrix.
+    D3 : (n,n) array – third derivative matrix (unused by K-S, included for interface).
+    w_flat : (n,) array – quadrature weights (uniform, L/n each).
+    w : (n,1) array – column version of w_flat.
+    """
+    N = n_states
+    h = L / N
+    xi = np.arange(N) * h                         # [0, h, 2h, ..., (N-1)h)
+    # Wavenumbers for real FFT ordering
+    k = (2 * np.pi / L) * np.fft.fftfreq(N, d=1.0 / N)  # [0, 1, 2, ..., N/2-1, -N/2+1, ..., -1] * 2pi/L
+
+    # Build differentiation matrices via F^{-1} diag(ik)^p F
+    F = np.fft.fft(np.eye(N), axis=0)             # DFT matrix (columns = basis vectors)
+    Finv = np.fft.ifft(np.eye(N), axis=0)          # inverse DFT
+
+    # Diagonal multipliers for d/dx, d²/dx², d³/dx³
+    ik1 = 1j * k
+    ik2 = (1j * k) ** 2
+    ik3 = (1j * k) ** 3
+
+    D  = np.real(Finv @ np.diag(ik1) @ F)
+    D2 = np.real(Finv @ np.diag(ik2) @ F)
+    D3 = np.real(Finv @ np.diag(ik3) @ F)
+
+    xi = xi.reshape(-1, 1)
+    w_flat = np.full(N, h)                         # uniform quadrature
+    w = w_flat.reshape(-1, 1)
+
+    return xi, D, D2, D3, w_flat, w
+
+
 def _build_full_grid_operators(n_states: int):
     """
     Build Chebyshev operators on the full grid on [0, 1] (including boundaries).
@@ -283,16 +329,161 @@ def _build_full_grid_operators(n_states: int):
     return xi, D, D2, D3, D4, w_flat, w
 
 
-def _default_control_matrix(n_states: int, n_controls: int) -> np.ndarray:
+def sample_initial_conditions_fourier(
+    xi: np.ndarray,
+    n_states: int,
+    n: int,
+    *,
+    modes: int = 5,
+    scale: float = 1.0,
+    use_sine: bool = True,
+    use_cosine: bool = False,
+    domain_type: str = "symmetric",
+    L: float = None,
+    seed: int = None,
+    **kwargs,
+) -> np.ndarray:
     """
-    Default uniform-identity control matrix: split state indices evenly across
-    controls. Use this when the problem has no specific spatial actuation;
-    otherwise override in the problem's __init__.
+    Unified Fourier-sum sampling of initial conditions (Burgers-style).
+    X0 = scale * sum_{k=1}^K [ a_k * sin(...) + b_k * cos(...) ] with
+    a_k, b_k = (2*rand-1) / k^0.5.
+
+    Parameters
+    ----------
+    xi : (n,) array
+        Spatial grid.
+    n_states, n : int
+        State dimension and number of samples.
+    modes : int
+        Number of Fourier modes K.
+    scale : float
+        Final multiplier.
+    use_sine, use_cosine : bool
+        Whether to include sine (a_k) and/or cosine (b_k) terms.
+    domain_type : str
+        'symmetric' for [-1,1], 'periodic' for [0,L).
+    L : float
+        Domain length for periodic.
+    seed : int, optional
+        Random seed.
+    **kwargs
+        Ignored (for API compatibility).
+
+    Returns
+    -------
+    X0 : (n_states, n) array
     """
-    B = np.zeros((n_states, n_controls), dtype=float)
-    parts = np.array_split(np.arange(n_states), n_controls)
-    for j, idx in enumerate(parts):
-        B[idx, j] = 1.0
+    if seed is not None:
+        np.random.seed(seed)
+    xi_flat = np.asarray(xi).flatten()
+    d = len(xi_flat)
+    X0 = np.zeros((d, n), dtype=float)
+
+    if domain_type == "symmetric":
+        # xi in [-1, 1]: sin(k*pi*xi), cos(k*pi*xi)
+        arg = np.pi * xi_flat
+        for k in range(1, modes + 1):
+            if use_sine:
+                ak = (2.0 * np.random.rand(1, n) - 1.0) / float(k) ** 0.5
+                X0 += ak * np.sin(k * arg).reshape(-1, 1)
+            if use_cosine:
+                bk = (2.0 * np.random.rand(1, n) - 1.0) / float(k) ** 0.5
+                X0 += bk * np.cos(k * arg).reshape(-1, 1)
+    elif domain_type == "periodic":
+        if L is None:
+            raise ValueError("L required for periodic domain")
+        # xi in [0, L): sin(2*pi*k*xi/L), cos(2*pi*k*xi/L)
+        arg = 2.0 * np.pi * xi_flat / L
+        for k in range(1, modes + 1):
+            if use_sine:
+                ak = (2.0 * np.random.rand(1, n) - 1.0) / float(k) ** 0.5
+                X0 += ak * np.sin(k * arg).reshape(-1, 1)
+            if use_cosine:
+                bk = (2.0 * np.random.rand(1, n) - 1.0) / float(k) ** 0.5
+                X0 += bk * np.cos(k * arg).reshape(-1, 1)
+    else:
+        raise ValueError(f"Unknown domain_type: {domain_type!r}")
+
+    return scale * X0
+
+
+def spatial_control_matrix(
+    xi: np.ndarray,
+    n_controls: int,
+    width: float,
+    *,
+    domain_type: str = "symmetric",
+    x_min: float = -1.0,
+    x_max: float = 1.0,
+    L: float = None,
+) -> np.ndarray:
+    """
+    Build spatial control matrix B with quadratic bump actuation (Burgers-style).
+    Actuators are evenly spaced, each column normalized to unit peak.
+
+    width is the fraction of domain length L: each bump spans L*width, so with
+    m controls the total footprint is m * L * width (e.g. 3 controls and
+    width=0.2 covers 0.6*L of the domain).
+
+    Each actuator j has shape b_j(x) = (x - left) * (x - right) for x in
+    [left, right]; zero elsewhere. Columns are scaled so max(b_j) = 1.
+
+    Parameters
+    ----------
+    xi : (n,) or (n, 1) array
+        Spatial grid points.
+    n_controls : int
+        Number of actuators.
+    width : float
+        Fraction of domain length (0, 1]. Each bump has physical width L * width.
+    domain_type : str
+        'symmetric' for bounded [x_min, x_max], 'periodic' for [0, L).
+    x_min, x_max : float
+        For domain_type='symmetric', domain bounds.
+    L : float
+        For domain_type='periodic', domain length.
+
+    Returns
+    -------
+    B : (n, n_controls) array
+    """
+    xi_flat = np.asarray(xi).flatten()
+    n = len(xi_flat)
+
+    if domain_type == "symmetric":
+        domain_L = x_max - x_min
+    elif domain_type == "periodic":
+        if L is None:
+            raise ValueError("L required for periodic domain")
+        domain_L = L
+    else:
+        raise ValueError(f"Unknown domain_type: {domain_type!r}")
+
+    bump_width = domain_L * width
+    eps = bump_width / 2.0
+
+    if domain_type == "symmetric":
+        centers = np.linspace(x_min + bump_width, x_max - bump_width, n_controls)
+    elif domain_type == "periodic":
+        centers = np.array([domain_L * j / n_controls for j in range(n_controls)])
+    else:
+        raise ValueError(f"Unknown domain_type: {domain_type!r}")
+
+    cols = []
+    for c in centers:
+        left, right = c - eps, c + eps
+        mask = (xi_flat >= left) & (xi_flat <= right)
+        g = np.zeros(n, dtype=float)
+        g[mask] = (xi_flat[mask] - left) * (xi_flat[mask] - right)
+        g = -g
+        g = np.abs(g)
+        cols.append(g.reshape(-1, 1))
+    B = np.hstack(cols)
+
+    col_max = B.max(axis=0, keepdims=True)
+    col_max[col_max <= 0] = 1.0
+    B = B / col_max
+
     return B
 
 
@@ -357,6 +548,25 @@ class BaseOCP:
             err = X
         return np.sqrt(np.sum(err**2 * self.w, axis=0))
 
+
+    def convergence(self, X, U, conv_tol, fp_tol):
+        """
+        Vectorized convergence test: running cost small AND dynamics small.
+        Same criterion as IndirectSolver.check_converged (the BVP gold standard).
+        Returns boolean array (one entry per column of X).
+        """
+        cost_small = self.running_cost(X, U) < conv_tol
+        dynamics_small = np.linalg.norm(self.dynamics(X, U), axis=0) < fp_tol
+        return cost_small & dynamics_small
+
+    def convergence_torch(self, f, L, conv_tol, fp_tol):
+        """
+        Torch mirror of convergence for training rollouts.
+        f: (B,d) dynamics, L: (B,) running cost. Returns (B,) bool tensor.
+        """
+        cost_small = L < conv_tol
+        dynamics_small = torch.norm(f, dim=1) < fp_tol
+        return cost_small & dynamics_small
 
     def _state_error(self, X):
         """State error from reference (self.X_bar; None = zero). Used in running cost."""
@@ -459,28 +669,6 @@ class BaseOCP:
         '''
         U = np.matmul(self.RBT, dVdX)
         return U
-
-    def jac_U_star(self, X, dVdX, U0=None):
-        '''
-        Evaluate the Jacobian of the optimal control with respect to the state,
-        leaving the costate fixed.
-
-        Parameters
-        ----------
-        X : (n_states,) or (n_states, n_points) array
-            State(s) arranged by (dimension, time).
-        dVdX : (n_states,) or (n_states, n_points) array
-            Costate(s) arranged by (dimension, time).
-        U0 : ignored
-            For API consistency only
-
-        Returns
-        -------
-        U : (n_controls,) or (n_controls, n_points) array
-            Optimal control(s) arranged by (dimension, time).
-        '''
-        dVdX = dVdX.reshape(self.n_states, -1)
-        return np.zeros((self.n_controls, self.n_states, dVdX.shape[-1]))
 
     def make_bc(self, X0):
         '''
@@ -632,6 +820,7 @@ class BaseOCP:
 
         return approx_derivative(self.constraint_fun, X, f0=C0)
 
+
     def sample_initial_conditions(self, n: int, seed=None, **kwargs):
         """
         Sample n initial conditions. Override in each problem; default raises
@@ -754,3 +943,27 @@ if torch is not None:
 
         def running_cost(self, x: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
             return _OCPRunningCostFunc.apply(x, u, self._ocp)
+
+
+def attach_ocp(config, ocp_class, defaults, overrides=None):
+    """Shared setup: create OCP, copy convenience attributes to config."""
+    overrides = overrides or {}
+    for k, v in defaults.items():
+        setattr(config, k, overrides.get(k, v))
+    config.ocp = ocp_class(config)
+    config.B = config.ocp.B
+    config.q = config.ocp.R
+    config.x_f = config.ocp.X_bar.flatten()
+    config.xi = config.ocp.xi
+    config.w = config.ocp.w
+    config.norm = config.ocp.norm
+    config.dynamics = config.ocp.dynamics
+    config.running_cost = config.ocp.running_cost
+    config.running_cost_gradient = config.ocp.running_cost_gradient
+    config.f_controlled = lambda t, x, u, cfg: cfg.ocp.dynamics(x, u)
+    config.jacobian_f = lambda x, cfg: cfg.ocp.jacobians(x, np.zeros((cfg.n_controls,)))[0]
+
+    # Derived: ic_basis for display (sine/cosine/both)
+    s = getattr(config, "ic_use_sine", False)
+    c = getattr(config, "ic_use_cosine", False)
+    config.ic_basis = "both" if (s and c) else ("sine" if s else ("cosine" if c else "none"))

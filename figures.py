@@ -108,12 +108,6 @@ def _iter_named_controllers(controllers):
             yield str(a), b
 
 
-def _is_lqr(name, obj) -> bool:
-    # Kept for backward compatibility (no longer used for styling).
-    if "lqr" in str(name).lower():
-        return True
-    return obj.__class__.__name__.lower() == "lqr"
-
 cmap = LinearSegmentedColormap.from_list(
     "blue_purple_blend",
     ["#56B4E9", "#7B2CBF"],
@@ -127,6 +121,45 @@ def _save_fig(fig, savepath, *, dpi=300):
     p = Path(savepath)
     p.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(str(p), dpi=dpi)
+
+
+def _ema_smooth(values, alpha=0.03):
+    """Exponential moving average. Returns array of same length."""
+    y = np.empty_like(values, dtype=float)
+    y[0] = float(values[0])
+    for i in range(1, len(values)):
+        y[i] = alpha * float(values[i]) + (1.0 - alpha) * y[i - 1]
+    return y
+
+
+def _kwargs_exact_epoch_line(lw: float):
+    """
+    Matplotlib kwargs for a polyline of *exact* per-epoch losses: straight segments
+    between consecutive points, no scatter markers. (EMA/MA are separate: use
+    ``smooth='ema'`` only when you want a smoothed trend, not pointwise exact values.)
+    """
+    return dict(
+        linestyle="-",
+        drawstyle="default",
+        marker=None,
+        solid_capstyle="butt",
+        solid_joinstyle="miter",
+        lw=lw,
+    )
+
+
+def _make_controller_color_map(controller_list):
+    """Build name -> color map from default prop_cycle, extended if needed."""
+    n = len(controller_list)
+    colors_list = list(plt.rcParams['axes.prop_cycle'].by_key()['color'])
+    while len(colors_list) < n:
+        colors_list.extend(colors_list)
+    return {name: colors_list[k] for k, (name, _) in enumerate(controller_list)}
+
+
+def _escape_tex(s):
+    return str(s).replace("_", "\\_").replace("%", "\\%").replace("&", "\\&")
+
 
 def V_from_gradnet_line_integral(grad_net, X, *, n_quad=16):
     """
@@ -198,7 +231,7 @@ def plot_value_vs_state_norm(
 
 
         # in plot_value_vs_state_norm:
-        ax.scatter(xnorm, V, s=float(s), alpha=float(alpha), label=_controller_name_to_legend(name))
+        ax.scatter(xnorm, V, s=float(s), alpha=float(alpha), label=_controller_name_to_latex(name))
 
     # hide negative values by cutting y-axis at 0
     _ymin, _ymax = ax.get_ylim()
@@ -399,50 +432,22 @@ def plot_value_analysis_combined(
     savepath=None,
     suffix: str = "",    # used for default savepath: figures/{system}_value_analysis{suffix}.pdf
 ):
+    """Three stacked plots: value vs norm, value flow, HJB residual. Saves as {savepath}_value_vs_norm.png, _value_flow.png, _hjb_residual.png."""
     if savepath is None and config is not None and hasattr(config, "system"):
         savepath = f"figures/{config.system}_value_analysis{suffix}.pdf"
-    """
-    Creates three separate plots and saves each as a PNG file:
-    1. Value vs state norm (scatter)
-    2. Value flow along trajectory (line)
-    3. HJB residual shock line (line)
-    
-    Ensures consistent colors across all three plots for each controller.
-    If savepath is provided, generates three PNG files with suffixes:
-    - {savepath}_value_vs_norm.png
-    - {savepath}_value_flow.png
-    - {savepath}_hjb_residual.png
-    """
     from controls.train import loss_unified
-    
-    # Normalize controllers to list of (name, controller) tuples
+
     controller_list = list(_iter_named_controllers(controllers))
-    n_controllers = len(controller_list)
-    
-    # Create consistent color mapping using matplotlib's default cycle
-    # Get the default color cycle
-    prop_cycle = plt.rcParams['axes.prop_cycle']
-    colors_list = prop_cycle.by_key()['color']
-    # Extend if needed
-    while len(colors_list) < n_controllers:
-        colors_list.extend(colors_list)
-    
-    # Create color map: name -> color
-    color_map = {name: colors_list[k] for k, (name, _) in enumerate(controller_list)}
-    
-    # Generate savepaths for 3 separate PNG files
-    def _make_savepath(base_path, suffix):
-        if base_path is None:
-            return None
-        p = Path(base_path)
-        # Replace extension with .png and add suffix
-        stem = p.stem
-        parent = p.parent
-        return str(parent / f"{stem}_{suffix}.png")
-    
-    savepath1 = _make_savepath(savepath, "value_vs_norm")
-    savepath2 = _make_savepath(savepath, "value_flow")
-    savepath3 = _make_savepath(savepath, "hjb_residual")
+    color_map = _make_controller_color_map(controller_list)
+
+    def _sub_path(suffix):
+        if savepath is None: return None
+        p = Path(savepath)
+        return str(p.parent / f"{p.stem}_{suffix}.png")
+
+    savepath1 = _sub_path("value_vs_norm")
+    savepath2 = _sub_path("value_flow")
+    savepath3 = _sub_path("hjb_residual")
     
     # Individual figure size for each plot
     individual_figsize = (6.2, 3.2)
@@ -457,7 +462,7 @@ def plot_value_analysis_combined(
     for name, ctrl in controller_list:
         V = _value_from_controller_or_gradnet(ctrl, X, device=device, n_quad=n_quad)
         color = color_map[name]
-        ax1.scatter(xnorm, V, s=float(s), alpha=float(alpha), label=_controller_name_to_legend(name), color=color)
+        ax1.scatter(xnorm, V, s=float(s), alpha=float(alpha), label=_controller_name_to_latex(name), color=color)
     
     _ymin, _ymax = ax1.get_ylim()
     ax1.set_ylim(0.0, max(0.0, float(_ymax)))
@@ -499,7 +504,7 @@ def plot_value_analysis_combined(
         )  # X: (d, Nt_eff)
         
         V = _value_from_controller_or_gradnet(ctrl, X, device=device, n_quad=int(n_quad))
-        ax2.plot(t, V, label=_controller_name_to_legend(name), color=color)
+        ax2.plot(t, V, label=_controller_name_to_latex(name), color=color)
         
         if mark_bumps and V.size >= 2:
             dV = np.diff(V)
@@ -560,15 +565,13 @@ def plot_value_analysis_combined(
             Xnp = shock[:, None] * float(s)                               # (d,1)
             Xt = torch.tensor(Xnp.T, dtype=torch.float32, device=device)  # (1,d)
             
-            total, hjb_err, dpc_err, sup_err = loss_unified(
+            total, hjb_err, sup_err, _, _ = loss_unified(
                 model,
                 (Xt,),
                 mode="unsupervised",
                 supervision=False,
             )
-            
-            hjb_sq = hjb_err
-            val = float(hjb_sq.detach().cpu().numpy())
+            val = float(hjb_err.detach().cpu().numpy())
             
             if metric == "abs":
                 val = np.sqrt(val + float(eps))
@@ -582,7 +585,7 @@ def plot_value_analysis_combined(
             
             ys.append(val)
         
-        ax3.plot(s_grid, ys, label=_controller_name_to_legend(name), color=color)
+        ax3.plot(s_grid, ys, label=_controller_name_to_latex(name), color=color)
     
     ax3.set_xlabel(r"$s$")
     ylab = (r"$\log_{10}(|\mathcal{H}|)$" if (metric == "abs" and log10) else
@@ -777,17 +780,29 @@ def plot_training_losses(
     logy: bool = True,
     color: str | None = None,
     title: str | None = None,
-    xlabel: str = "iteration",
-    ylabel: str = "$\mathcal{L}$",
+    xlabel: str = r"rollout epoch ($E$)",
+    ylabel: str = r"training loss ($\mathcal{L}_{\mathrm{HJB}}$)",
     figsize=(6.2, 3.2),
     savepath=None,
     config=None,
-    plot_name: str = "loss_curve",   # used for default savepath: figures/{system}_{plot_name}.pdf
+    plot_name: str = "loss_curve",
     series=None,
-    smooth: str | None = "ema",
-    ema_alpha: float = 0.03,        # for EMA
-    ma_window: int = 200,           # for moving average
+    smooth: str | None = None,
+    ema_alpha: float = 0.03,
+    ma_window: int = 200,
+    batch_size: int | None = None,
+    marker: str | None = None,
+    markersize: float = 3.5,
 ):
+    """
+    Plot training loss vs rollout index.
+
+    - **Default** ``smooth=None``: **exact** loss recorded after each epoch/rollout,
+      connected by **straight line segments** (no markers, no EMA). Spikes are preserved.
+    - ``smooth='ema'`` / ``smooth='ma'``: **smoothed** curve that does **not** pass
+      through each epoch's value—use only if you want a trend line, not exact logs.
+    - Pass ``marker='o'`` etc. to overlay explicit point markers.
+    """
     if savepath is None and config is not None and hasattr(config, "system"):
         savepath = f"figures/{config.system}_{plot_name}.pdf"
     # Allow passing history dicts: (name, history_dict) or (name, iters, losses, phase)
@@ -795,6 +810,8 @@ def plot_training_losses(
     for item in series:
         if len(item) == 2 and isinstance(item[1], dict):
             name_k, h = item
+            if batch_size is None and "batch_size" in h:
+                batch_size = int(h["batch_size"])
             norm_series.append((name_k, h.get("iters"), h.get("loss"), h.get("phase")))
         elif len(item) == 3:
             name_k, it_k, lo_k = item
@@ -804,6 +821,8 @@ def plot_training_losses(
             norm_series.append((name_k, it_k, lo_k, ph_k))
         else:
             raise ValueError("Each series entry must be (name,iters,losses), (name,history_dict), or (name,iters,losses,phase).")
+    if batch_size is None:
+        batch_size = 1
 
     # Extract unsupervised phases and reset iterations - SAME for ALL controllers
     fig, ax = plt.subplots(figsize=figsize, constrained_layout=False)
@@ -823,8 +842,8 @@ def plot_training_losses(
                     continue  # Skip if all supervised
                 it_k = it_k[unsup_mask]
                 lo_k = lo_k[unsup_mask]
-        elif "hybrid" in str(name_k).lower():
-            # For hybrid models without phase info (old checkpoints):
+        elif "pre" in str(name_k).lower():
+            # For pretrained models without phase info (old checkpoints):
             # Detect phase boundary by looking for a jump in iterations
             # Supervised phase has consecutive iterations, then unsupervised starts at higher number
             if len(it_k) > 1:
@@ -837,35 +856,31 @@ def plot_training_losses(
                     it_k = it_k[unsup_start:]
                     lo_k = lo_k[unsup_start:]
         
-        # For ALL controllers: reset iterations to start at 1
+        # For ALL controllers: reset iterations to start at 1 and scale by batch_size
         if len(it_k) == 0:
             continue
-        it_k = it_k - it_k[0] + 1
+        it_k = (it_k - it_k[0] + 1) * batch_size
 
-        # Smooth and plot - SAME for ALL
         if smooth is None:
             it_plot, y_plot = it_k, lo_k
         elif smooth == "ema":
-            y = np.empty_like(lo_k, dtype=float)
-            y[0] = float(lo_k[0])
-            a = float(ema_alpha)
-            for i in range(1, len(lo_k)):
-                y[i] = a * float(lo_k[i]) + (1.0 - a) * y[i - 1]
-            it_plot, y_plot = it_k, y
+            it_plot, y_plot = it_k, _ema_smooth(lo_k, alpha=float(ema_alpha))
         elif smooth == "ma":
             w = int(ma_window)
             if w < 2 or w > len(lo_k):
                 raise ValueError("ma_window must be in [2, len(losses)]")
-            y = np.convolve(lo_k, np.ones(w) / w, mode="valid")
+            y_plot = np.convolve(lo_k, np.ones(w) / w, mode="valid")
             it_plot = it_k[w - 1 :]
-            y_plot = y
         else:
             raise ValueError("smooth must be None, 'ema', or 'ma'")
 
+        # Exact epoch losses: straight segments, no markers (unless ``marker`` set)
+        plot_kw = {**_kwargs_exact_epoch_line(1.8), "label": _controller_name_to_latex(name_k)}
+        if marker:
+            plot_kw.update(marker=marker, markersize=markersize)
         if color is not None:
-            ax.plot(it_plot, y_plot, color=str(color), lw=1.8, label=_controller_name_to_legend(name_k))
-        else:
-            ax.plot(it_plot, y_plot, label=_controller_name_to_legend(name_k))
+            plot_kw["color"] = str(color)
+        ax.plot(it_plot, y_plot, **plot_kw)
 
     if logy:
         ax.set_yscale("log")
@@ -888,16 +903,30 @@ def plot_training_val_mse(
     figsize=(6.2, 3.2),
     savepath=None,
     plot_name: str = "val_mse_curve",
-    smooth: str | None = "ema",
+    smooth: str | None = None,
     ema_alpha: float = 0.03,
+    batch_size: int | None = None,
+    marker: str | None = None,
+    markersize: float = 3.5,
 ):
     """
-    Plot validation MSE over iterations for all trained controllers (unsupervised phases only).
-    Same layout as plot_training_losses: one line per controller, optional EMA smoothing.
-    Pretraining (supervised) phase is excluded when history contains n_sup_epochs.
+    Plot validation MSE over rollouts (unsupervised phase only).
+    Supervised pretraining phase is stripped using the phase array so that
+    pretrained models have the same x-axis length as non-pretrained ones.
+
+    Default ``smooth=None`` plots **exact** val MSE per rollout as straight segments
+    (no markers). ``smooth='ema'`` smooths and does not match each rollout exactly.
+    Pass ``marker='o'`` to show points at each rollout.
     """
     if series is None and histories is not None and controller_configs is not None:
         series = [(name, histories[name]) for name in controller_configs if controller_configs.get(name, {}).get("enabled") and name in histories and "val_mse" in histories[name]]
+    if batch_size is None:
+        for _, h in (series or []):
+            if isinstance(h, dict) and "batch_size" in h:
+                batch_size = int(h["batch_size"])
+                break
+    if batch_size is None:
+        batch_size = 1
     if not series:
         return None, None
     if savepath is None and config is not None and hasattr(config, "system"):
@@ -907,21 +936,38 @@ def plot_training_val_mse(
         val_mse = np.asarray(h.get("val_mse"))
         if val_mse.size == 0:
             continue
-        n_sup = int(h.get("n_sup_epochs", 0))
-        val_mse = val_mse[n_sup:]  # unsupervised phases only
+
+        phase = h.get("phase")
+        if phase is not None:
+            ph = np.asarray(phase).reshape(-1)
+            n_unsup_iters = int(np.sum(ph != "sup"))
+            n_sup_val = max(0, val_mse.size - n_unsup_iters)
+            val_mse = val_mse[n_sup_val:]
+
         if val_mse.size == 0:
             continue
-        it = np.arange(1, val_mse.size + 1, dtype=float)
+        it = np.arange(1, val_mse.size + 1, dtype=float) * batch_size
+        lbl = _controller_name_to_latex(name)
         if smooth == "ema":
-            y = np.empty_like(val_mse, dtype=float)
-            y[0] = float(val_mse[0])
-            for i in range(1, len(val_mse)):
-                y[i] = ema_alpha * float(val_mse[i]) + (1.0 - ema_alpha) * y[i - 1]
-            ax.plot(it, y, label=_controller_name_to_legend(name))
+            ax.plot(
+                it,
+                _ema_smooth(val_mse, alpha=float(ema_alpha)),
+                **{**_kwargs_exact_epoch_line(1.2), "label": lbl},
+            )
+        elif marker:
+            ax.plot(
+                it,
+                val_mse,
+                marker=marker,
+                markersize=markersize,
+                linestyle="-",
+                lw=1.2,
+                label=lbl,
+            )
         else:
-            ax.plot(it, val_mse, label=_controller_name_to_legend(name))
-    ax.set_xlabel("iteration")
-    ax.set_ylabel("validation MSE")
+            ax.plot(it, val_mse, **{**_kwargs_exact_epoch_line(1.2), "label": lbl})
+    ax.set_xlabel("rollout epoch ($E$)")
+    ax.set_ylabel("validation loss ($\mathcal{L}_{\mathrm{sup}}$)")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend()
     fig.subplots_adjust(left=0.14, right=0.86, bottom=0.16, top=0.96)
@@ -933,19 +979,7 @@ def plot_training_val_mse(
 # Tables
 # -------------------------------------------------------------------------
 
-def eikonal_eval_series(ocp, controller, X_val=None, dVdX_val=None):
-    """
-    Eikonal evaluation metrics as a pandas Series.
-    HJB residual always; MSE vs exact only when dim_d == 1.
-    """
-    from evaluation import evaluate_eikonal
-    m = evaluate_eikonal(ocp, controller, X_val=X_val, dVdX_val=dVdX_val)
-    row = {"HJB res (mean)": m["hjb_residual_mean"], "HJB res (max)": m["hjb_residual_max"]}
-    if m["mse_grad"] is not None:
-        row["MSE ∇V"] = m["mse_grad"]
-    if m["mse_V"] is not None:
-        row["MSE V"] = m["mse_V"]
-    return pd.Series(row)
+
 
 def save_dataframe_latex(df, savepath, caption=None, label=None, precision=4):
     os.makedirs(os.path.dirname(savepath) or ".", exist_ok=True)
@@ -956,15 +990,11 @@ def save_dataframe_latex(df, savepath, caption=None, label=None, precision=4):
             return f"{x:.2e}" if (abs(x) < 1e-4 or abs(x) > 1e4) else f"{x:.{precision}g}"
         return str(x)
 
-    def escape_tex(s):
-        return str(s).replace("_", "\\_").replace("%", "\\%").replace("&", "\\&")
-        
     for col in disp_df.columns:
         if col == "Method":
-            # Leave Method as-is (already LaTeX e.g. $u_{\theta}$); don't escape or fmt
             continue
-        disp_df[col] = disp_df[col].map(fmt).map(escape_tex)
-    disp_df.columns = disp_df.columns.map(escape_tex)
+        disp_df[col] = disp_df[col].map(fmt).map(_escape_tex)
+    disp_df.columns = disp_df.columns.map(_escape_tex)
 
     # Use Styler for Pandas 2.0+
     styler = disp_df.style.hide(axis="index")
@@ -1019,34 +1049,47 @@ def _fmt_tex_num(x):
     return str(x)
 
 
-def save_config_table(config, savepath="config.tex"):
+# Default keys for problem config tables (show_spec, save_config_table)
+DEFAULT_CONFIG_KEYS = [
+    "system", "seed", "n_states", "n_controls", "t1_initial", "nu",
+    "control_width", "ic_modes", "ic_scale", "ic_basis",
+]
+
+
+def save_config_table(config, savepath="config.tex", keys=None):
     """Save config table in horizontal format (one row of headers, one row of values)."""
-    keys = ["system", "seed", "n_states", "n_controls", "t1_initial", "fp_tol", "nu"]
+    keys = keys or DEFAULT_CONFIG_KEYS
     valid_keys = [k for k in keys if hasattr(config, k)]
     values = [getattr(config, k) for k in valid_keys]
-    
+
     formatted_values = []
     for k, v in zip(valid_keys, values):
-        if k == "system":
+        if k == "system" or k == "ic_basis":
             formatted_values.append(str(v))
-        elif k in ["seed", "n_states", "n_controls"]:
+        elif k in ["seed", "n_states", "n_controls", "ic_modes"]:
             formatted_values.append(_fmt_tex_num(int(v)))
-        elif k in ["t1_initial", "fp_tol", "nu"]:
+        elif k in ["t1_initial", "nu", "control_width", "ic_scale"]:
             formatted_values.append(_fmt_tex_num(float(v)))
         else:
             formatted_values.append(_fmt_tex_num(v) if isinstance(v, (int, float, np.floating)) else str(v))
-    
+
     full_path = _output_path(savepath, config, "tables")
     os.makedirs(os.path.dirname(full_path) or ".", exist_ok=True)
-    
+
     header_map = {
         "system": "system",
         "seed": "seed",
         "n_states": "$n$",
         "n_controls": "$m$",
-        "t1_initial": "$t_1$",
-        "fp_tol": "$\\epsilon$",
-        "nu": "$\\nu$"
+        "t1_initial": "$T$",
+        "nu": r"$\nu$",
+        "control_width": r"$w$",
+        "ic_modes": "$K$",
+        "ic_scale": "$c$",
+        "ic_basis": "IC basis",
+        "gamma1": r"$\gamma_1$",
+        "gamma2": r"$\gamma_2$",
+        "R": "$R$",
     }
     headers = [header_map.get(k, k) for k in valid_keys]
     
@@ -1075,17 +1118,11 @@ def _controller_name_to_latex(name):
     return name
 
 
-def _controller_name_to_legend(name):
-    """Alias for _controller_name_to_latex (same mathtext-safe labels for plot legends)."""
-    return _controller_name_to_latex(name)
-
-
 def save_results_table(results_list, config=None, savepath="results.tex"):
     """
     Reformats the flat results list into a professional Thesis table.
     Groups by Controller and stacks Standard/Hard datasets as rows.
     """
-    import pandas as pd
     df = pd.DataFrame(results_list)
     
     # 1. Clean up the naming for the Thesis
@@ -1100,8 +1137,7 @@ def save_results_table(results_list, config=None, savepath="results.tex"):
     if "Method" in df.columns:
         df["Method"] = df["Method"].apply(_controller_name_to_latex)
 
-    # 2. Reorder columns: Method, Data, S, J, t_conv
-    cols = ["Method", "Data", "$S$", "$J_{\text{avg}}$", "$t_{\text{conv}}$"]
+    cols = ["Method", "Data", "$S$", "$J_{\\text{avg}}$"]
     df = df[[c for c in cols if c in df.columns]]
 
     # 3. Format 'S' as LaTeX math percentage, e.g. $98\%$
@@ -1121,7 +1157,6 @@ def save_results_table(results_list, config=None, savepath="results.tex"):
 
 def save_data_summary_table(config, data, savepath="data_summary.tex"):
     """Save data summary table in specific LaTeX format."""
-    import numpy as np
     
     X_all = np.asarray(data["X"])
     t_all = np.asarray(data["t"]).reshape(-1)
@@ -1220,9 +1255,6 @@ def save_robustness_table_latex(df, savepath, config=None, caption=None, label=N
     stab_name = level0[0]
     cost_name = level0[n_c]
 
-    def escape_tex(s):
-        return str(s).replace("_", "\\_").replace("%", "\\%").replace("&", "\\&")
-
     with open(full_path, "w", encoding="utf-8") as f:
         col_spec = "l|" + "c" * n_c + "|" + "c" * n_c
         f.write(f"\\begin{{tabular}}{{{col_spec}}}\n")
@@ -1254,32 +1286,30 @@ def _save_train_config_latex(cfg, savepath):
     os.makedirs(os.path.dirname(savepath) or ".", exist_ok=True)
     
     epochs_sup = getattr(cfg, 'sup_epochs', 1)
-    epochs_unsup = getattr(cfg, 'unsup_epochs', 5)
-    steps = getattr(cfg, 'unsup_n_steps', 70)
+    epochs_unsup = getattr(cfg, 'rollouts', 5)
     horizon = getattr(cfg, 'horizon', 30)
     lr = getattr(cfg, 'unsup_lr', 5e-4)
     lambda_sup = getattr(cfg, 'lambda_sup_base', 0.5)
     batch_size = getattr(cfg, 'batch_size', None)
     n_cand = getattr(cfg, 'n_candidates', getattr(cfg, 'n_cand', None))
-    dt_min = getattr(cfg, 'dt_min', 1e-8)
     dt_max = getattr(cfg, 'dt_max', 0.1)
     batch_size_tex = _fmt_tex_num(int(batch_size)) if batch_size is not None else "---"
     n_cand_tex = _fmt_tex_num(int(n_cand)) if n_cand is not None else "---"
     
     with open(savepath, "w", encoding="utf-8") as f:
-        f.write("\\begin{tabular}{@{}ccccccccccc@{}}\n")
+        f.write("\\begin{tabular}{@{}cccccccc@{}}\n")
         f.write("\\toprule\n")
-        f.write("$E_{\\mathrm{sup}}$ & $E_{\\mathrm{unsup}}$ & $S_{\\mathrm{unsup}}$ & $h$ & $\\lambda_{\\text{sup}}$ & $\\mu$ & $|\\mathcal{B}|$ & $n_{\\mathrm{cand}}$ & $\\Delta t_{\\min}$ & $\\Delta t_{\\max}$ \\\\\n")
+        f.write("$E_{\\mathrm{sup}}$ & $N_{\\mathrm{ro}}$ & $h$ & $\\lambda_{\\text{sup}}$ & $\\mu$ & $|\\mathcal{B}|$ & $n_{\\mathrm{cand}}$ & $\\Delta t_{\\max}$ \\\\\n")
         f.write("\\midrule\n")
-        f.write(f"{_fmt_tex_num(int(epochs_sup))} & {_fmt_tex_num(int(epochs_unsup))} & {_fmt_tex_num(int(steps))} & {_fmt_tex_num(int(horizon))} & {_fmt_tex_num(float(lambda_sup))} & {_fmt_tex_num(float(lr))} & {batch_size_tex} & {n_cand_tex} & {_fmt_tex_num(float(dt_min))} & {_fmt_tex_num(float(dt_max))} \\\\\n")
+        f.write(f"{_fmt_tex_num(int(epochs_sup))} & {_fmt_tex_num(int(epochs_unsup))} & {_fmt_tex_num(int(horizon))} & {_fmt_tex_num(float(lambda_sup))} & {_fmt_tex_num(float(lr))} & {batch_size_tex} & {n_cand_tex} & {_fmt_tex_num(float(dt_max))} \\\\\n")
         f.write("\\bottomrule\n")
         f.write("\\end{tabular}\n")
 
 
 def show_monte_carlo_results(results_dict, controller_name="Controller", title=None):
     """
-    Display Monte Carlo evaluation results in a nice formatted table.
-    
+    Display Monte Carlo results: controllers as columns, metrics (S, J) as rows.
+
     Parameters
     ----------
     results_dict : dict or dict of dicts
@@ -1289,54 +1319,50 @@ def show_monte_carlo_results(results_dict, controller_name="Controller", title=N
     title : str, optional
         Title for the table
     """
-    import numpy as np
-    
-    # Check if this is a dict of results (multiple controllers)
     if isinstance(results_dict, dict) and 'X0_pool' not in results_dict:
-        # Multiple controllers - create comparison table
-        rows = []
-        for name, res in results_dict.items():
-            rows.append(_compute_monte_carlo_stats(res, name))
-        
-        df = pd.DataFrame(rows)
+        stats = {name: _compute_monte_carlo_stats(res, name) for name, res in results_dict.items()}
     else:
-        # Single controller
-        df = _compute_monte_carlo_stats(results_dict, controller_name)
-        df = pd.DataFrame([df])
-    
+        stats = {controller_name: _compute_monte_carlo_stats(results_dict, controller_name)}
+
+    df = pd.DataFrame({
+        name: {"Stability (S)": s["Stability (S)"], "Cost J (mean)": s["Cost J (mean)"]}
+        for name, s in stats.items()
+    })
+
     if title:
         display(Markdown(f"**{title}**"))
-    
-    display(df.style.hide(axis="index").set_table_styles([
+
+    display(df.style.set_table_styles([
         {'selector': 'th', 'props': [('background-color', '#f4f4f4'), ('color', 'black'), ('font-weight', 'bold')]}
     ]))
-    
+
     return df
 
-def _compute_monte_carlo_stats(results_dict, controller_name):
-    """Helper to compute stats for a single controller."""
-    import numpy as np
-    
+def _raw_monte_carlo_stats(results_dict):
+    """Extract raw stats (stability, cost_mean) from a single controller's results."""
     NN_final_times = np.asarray(results_dict['NN_final_times'])
     NN_costs = np.asarray(results_dict['NN_costs'])
-    
     converged_mask = np.isfinite(NN_final_times)
-    n_converged = np.sum(converged_mask)
+    n_converged = int(np.sum(converged_mask))
     n_total = len(NN_final_times)
     stability = n_converged / n_total if n_total > 0 else 0.0
-    
+    cost_mean = np.mean(NN_costs[converged_mask]) if n_converged > 0 else np.nan
+    return stability, cost_mean
+
+
+def _compute_monte_carlo_stats(results_dict, controller_name):
+    """Helper to compute display stats for a single controller."""
+    stability, cost_mean = _raw_monte_carlo_stats(results_dict)
     return {
         "Controller": controller_name,
         "Stability (S)": f"{stability:.1%}",
-        "Cost J (mean)": f"{np.mean(NN_costs[converged_mask]):.4f}" if n_converged > 0 else "N/A",
-        "t_conv (mean)": f"{np.mean(NN_final_times[converged_mask]):.2f}" if n_converged > 0 else "N/A",
+        "Cost J (mean)": f"{cost_mean:.2f}" if np.isfinite(cost_mean) else "N/A",
     }
 
 
 def save_monte_carlo_results(results_dict, controller_name="Controller", config=None, 
                             savepath="monte_carlo.tex"):
-    """Save Monte Carlo results to LaTeX table with format: Model | Stability S | Cost J (mean) | t_conv (mean)."""
-    import numpy as np
+    """Save Monte Carlo results to LaTeX table: controllers as columns, S and J as rows."""
     
     if isinstance(results_dict, dict) and 'X0_pool' not in results_dict:
         rows = []
@@ -1352,56 +1378,39 @@ def save_monte_carlo_results(results_dict, controller_name="Controller", config=
     return df
 
 def _save_monte_carlo_latex(df, savepath):
-    """Save Monte Carlo table in specific LaTeX format with toprule/midrule/bottomrule."""
+    """Save Monte Carlo table: controllers as columns, metrics (S, J) as rows."""
     os.makedirs(os.path.dirname(savepath) or ".", exist_ok=True)
-    
+
     def fmt_stability(x):
         if isinstance(x, (float, np.floating)) and not np.isnan(x):
-            return f"${x*100:.1f}\\%$"
+            return f"${x*100:.0f}\\%$"
         return "N/A"
-    
+
     def fmt_float(x, decimals=2):
         if isinstance(x, (float, np.floating)) and not np.isnan(x):
-            return f"{x:.{decimals}f}"
+            return f"${x:.{decimals}f}$"
         return "N/A"
-    
-    def escape_tex(s):
-        return str(s).replace("_", "\\_").replace("%", "\\%").replace("&", "\\&")
-    
+
+    models = [_controller_name_to_latex(m) for m in df["Model"]]
+    n = len(models)
+
     with open(savepath, "w", encoding="utf-8") as f:
-        f.write("\\begin{tabular}{lrrr}\n")
+        f.write(f"\\begin{{tabular}}{{l{'r' * n}}}\n")
         f.write("\\toprule\n")
-        f.write("Model & Stability $S$ & Cost $J$ (mean) & $t_{\\text{conv}}$ (mean) \\\\\n")
+        f.write(" & " + " & ".join(models) + " \\\\\n")
         f.write("\\midrule\n")
-        
-        for _, row in df.iterrows():
-            model = _controller_name_to_latex(row["Model"])
-            stability = fmt_stability(row["Stability $S$"])
-            cost = fmt_float(row["Cost $J$ (mean)"], decimals=4)
-            t_conv = fmt_float(row["$t_{\\text{conv}}$ (mean)"], decimals=2)
-            f.write(f"{model} & {stability}  & {cost}  & {t_conv} \\\\\n")
-        
+        stab_vals = " & ".join(fmt_stability(v) for v in df["Stability $S$"])
+        f.write(f"Stability $S$ & {stab_vals} \\\\\n")
+        cost_vals = " & ".join(fmt_float(v, decimals=2) for v in df["Cost $J$ (mean)"])
+        f.write(f"Cost $J$ & {cost_vals} \\\\\n")
         f.write("\\bottomrule\n")
         f.write("\\end{tabular}\n")
 
 def _compute_monte_carlo_stats_latex(results_dict, controller_name):
-    """Helper for LaTeX formatting - returns only Model, Stability S, t_conv (mean), Cost J (mean)."""
-    import numpy as np
-    
-    NN_final_times = np.asarray(results_dict['NN_final_times'])
-    NN_costs = np.asarray(results_dict['NN_costs'])
-    
-    converged_mask = np.isfinite(NN_final_times)
-    n_converged = np.sum(converged_mask)
-    n_total = len(NN_final_times)
-    stability = n_converged / n_total if n_total > 0 else 0.0
-    
-    t_conv_mean = np.mean(NN_final_times[converged_mask]) if n_converged > 0 else np.nan
-    cost_mean = np.mean(NN_costs[converged_mask]) if n_converged > 0 else np.nan
-    
+    """Helper for LaTeX table: returns Model, Stability $S$, Cost $J$ (mean)."""
+    stability, cost_mean = _raw_monte_carlo_stats(results_dict)
     return {
         "Model": controller_name,
         "Stability $S$": stability,
         "Cost $J$ (mean)": cost_mean,
-        "$t_{\\text{conv}}$ (mean)": t_conv_mean,
     }

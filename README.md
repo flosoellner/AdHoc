@@ -10,7 +10,7 @@ The AdHOC framework is built on three pillars:
 
 1. **LQR-residual architecture:** The model learns a nonlinear residual relative to a locally optimal Linear–Quadratic Regulator (LQR) baseline, ensuring local stability at the equilibrium.
 
-2. **Hybrid training:** Supervised pretraining on PMP-generated costate data, followed by unsupervised HJB refinement (minimizing the Bellman residual).
+2. **Unsupervised training with optional pretraining:** Physics-informed HJB minimisation, optionally preceded by supervised pretraining on PMP-generated costate data.
 
 3. **Adaptive sampling:** Steepness-aware importance sampling that concentrates training on dynamically challenging regions of the state space.
 
@@ -32,7 +32,7 @@ pip install -e .
 
 ## Usage
 
-Training follows a two-phase curriculum: (1) supervised pretraining on PMP-generated state–costate pairs; (2) unsupervised refinement using the HJB residual along rollouts. Run the notebooks in `experiments/` (e.g. `burgers.ipynb`, `allen_cahn.ipynb`) from the project root or from the `experiments` directory.
+Training is unsupervised (HJB residual along rollouts), with an optional supervised pretraining phase on PMP-generated state–costate pairs (`pretrain=True`). Run the notebooks in `experiments/` (e.g. `burgers.ipynb`, `allen_cahn.ipynb`) from the project root or from the `experiments` directory.
 
 ```python
 from experiments import create_config

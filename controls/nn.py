@@ -32,12 +32,13 @@ class TorchWrapperMixin:
 
 
 class GradNet(nn.Module, TorchWrapperMixin):
-    def __init__(self, config, hidden=256, depth=2, act=nn.Tanh, use_lqr=True):
+    def __init__(self, config, hidden=None, depth=2, act=nn.Tanh, use_lqr=True):
         super().__init__()
         self.config = config
         self.use_lqr = use_lqr
         d = config.n_states
-
+        if hidden is None:
+            hidden = 4 * d
 
         self.net = make_mlp(d, d, hidden=hidden, depth=depth, act=act)
         last = self.net[-1]
@@ -80,9 +81,9 @@ class Control(nn.Module, TorchWrapperMixin):
         if self.grad_net is not None:
             g = self.grad_net(x)                 # (N,d) torch
         elif self.value_net is not None and self.use_autograd:
-            g = grad_from_value_autograd(self.value_net, x)
+            raise NotImplementedError("autograd value-net path not implemented")
         else:
-            raise ValueError(...)
+            raise ValueError("Control requires grad_net or value_net")
 
         # convert to numpy for u_analytic (expects (d,N))
         g_np = g.detach().cpu().numpy().T        # (d,N)

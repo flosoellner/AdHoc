@@ -1,21 +1,34 @@
+import os
+import json
+import hashlib
 import time
 import warnings
+
 import numpy as np
-from scipy.interpolate import interp1d
+import torch
 import sampling
-
-
 import simulation
+
 
 _headers = (
     '\n attempted |  solved   |  desired  ',
     '-----------------------------------'
 )
 
+
+def _resample_valid_ic(config, n=1, max_attempts=10, seed=None):
+    """Sample until a finite IC is found, or return None after max_attempts."""
+    for _ in range(max_attempts):
+        X0 = sampling.sample_conditions(config, n, seed=seed)
+        if X0.shape[0] != config.ocp.n_states:
+            X0 = X0.T
+        if np.isfinite(X0).all():
+            return X0.flatten() if n == 1 else X0
+    return None
+
 def generate(
         OCP, config, n_trajectories, controller=None, resolve_failed=True,
-        verbose=0, suppress_warnings=True, adaptive_sampling="gradient",
-        n_candidates=None
+        verbose=0, suppress_warnings=True
     ):
     '''
     Generate data for an OCP by solving n_trajectories open loop OCPs. Uses LQR
@@ -40,8 +53,6 @@ def generate(
         See scipy.integrate.solve_bvp
     suppress_warnings : bool, default=True
         If True, treat numpy warnings as BVP failures
-    adaptive_sampling : str, default="gradient"
-        Adaptive sampling method: "gradient" (gradient residual) or "hjb" (HJB residual norm)
 
     Returns
     -------
@@ -68,25 +79,17 @@ def generate(
     fail_time : float
         Total time of failed solution attempts in seconds
     '''
-    if n_candidates is None:
-        raise ValueError("n_candidates must be set by the experiment (e.g. n_candidates=200)")
     data = {}
 
     events = OCP.make_integration_events()
 
+    _DATA_TOL = 1e-02
     def open_converged(X, U):
-        return OCP.running_cost(X, U) < config.fp_tol
+        return OCP.running_cost(X, U) < _DATA_TOL
 
-    sampling_controller = OCP.LQR
-
-    X0_pool, _ = sampling.adaptive_sample_conditions(
-        config, n_trajectories,
-        controller=sampling_controller,
-        n_candidates=n_candidates,
-        seed=config.seed
-    )
+    X0_pool = sampling.sample_conditions(config, n_trajectories, seed=config.seed)
     if X0_pool.shape[0] != OCP.n_states:
-        X0_pool = X0_pool.T  # Ensure (n_states, n_trajectories)
+        X0_pool = X0_pool.T
 
     valid_mask = np.isfinite(X0_pool).all(axis=0)
     if not valid_mask.all():
@@ -95,26 +98,13 @@ def generate(
         X0_pool = X0_pool[:, valid_mask]
     if X0_pool.shape[1] < n_trajectories:
         n_needed = n_trajectories - X0_pool.shape[1]
-        if config.system == "eikonal":
-            X0_additional = sampling.sample_conditions(config, n_needed, seed=None)
-        else:
-            X0_additional, _ = sampling.adaptive_sample_conditions(
-                config, n_needed, controller=sampling_controller,
-                n_candidates=n_candidates,
-                seed=None
-            )
+        X0_additional = sampling.sample_conditions(config, n_needed, seed=None)
         if X0_additional.shape[0] != OCP.n_states:
             X0_additional = X0_additional.T
         valid_additional = np.isfinite(X0_additional).all(axis=0)
         X0_additional = X0_additional[:, valid_additional]
         if X0_additional.shape[1] > 0:
             X0_pool = np.hstack([X0_pool, X0_additional])
-    if X0_pool.shape[1] < n_trajectories:
-        n_still_needed = n_trajectories - X0_pool.shape[1]
-        X0_simple = sampling.sample_conditions(config, n_still_needed, seed=None)
-        if X0_simple.shape[0] != OCP.n_states:
-            X0_simple = X0_simple.T
-        X0_pool = np.hstack([X0_pool, X0_simple[:, :n_still_needed]])
 
     n_attempt = 0
     n_sol = 0
@@ -147,15 +137,9 @@ def generate(
                 # Need more samples - resample
                 n_needed = n_trajectories - n_track()
 
-                X0_additional, _ = sampling.adaptive_sample_conditions(
-                    config, n_needed,
-                    controller=sampling_controller,
-                    n_candidates=n_candidates,
-                    seed=None
-                )
+                X0_additional = sampling.sample_conditions(config, n_needed, seed=None)
                 if X0_additional.shape[0] != OCP.n_states:
                     X0_additional = X0_additional.T
-                # Filter non-finite values
                 valid_additional = np.isfinite(X0_additional).all(axis=0)
                 X0_additional = X0_additional[:, valid_additional]
                 if X0_additional.shape[1] > 0:
@@ -163,40 +147,20 @@ def generate(
             
             X0 = X0_pool[:, n_track()].flatten()
             
-            # Validate X0 before using it
             if not np.isfinite(X0).all():
-                # Skip this invalid initial condition and resample
                 if resolve_failed:
-                    # Try to get a valid sample
-                    max_resample_attempts = 10
-                    X0_new = None
-                    for _ in range(max_resample_attempts):
-                        X0_candidate = sampling.sample_conditions(config, 1, seed=None)
-                        if X0_candidate.shape[0] != OCP.n_states:
-                            X0_candidate = X0_candidate.T
-                        if np.isfinite(X0_candidate).all():
-                            X0_new = X0_candidate.flatten()
-                            break
-                    
+                    X0_new = _resample_valid_ic(config)
                     if X0_new is not None:
-                        # Replace in pool and use the new X0
                         if n_track() < X0_pool.shape[1]:
                             X0_pool[:, n_track()] = X0_new
                         else:
                             X0_pool = np.hstack([X0_pool, X0_new.reshape(-1, 1)])
                         X0 = X0_new
-                        # Continue with the resampled X0 (don't skip)
                     else:
-                        # Still invalid after max attempts, skip this attempt
-                        n_attempt += 1
-                        n_fail += 1
-                        fail_time.append(0.0)
+                        n_attempt += 1; n_fail += 1; fail_time.append(0.0)
                         continue
                 else:
-                    # Not resolving failed, just skip
-                    n_attempt += 1
-                    n_fail += 1
-                    fail_time.append(0.0)
+                    n_attempt += 1; n_fail += 1; fail_time.append(0.0)
                     continue
 
             n_attempt += 1
@@ -269,25 +233,12 @@ def generate(
                 if verbose > 0:
                     print(f"\nFailure reason: {type(e).__name__}: {str(e)}")
 
-                # Resample the failed initial condition
                 if resolve_failed:
-                    # Try to get a valid sample
-                    max_resample_attempts = 10
-                    X0_new = None
-                    for _ in range(max_resample_attempts):
-                        X0_candidate = sampling.sample_conditions(config, 1, seed=None)
-                        if X0_candidate.shape[0] != OCP.n_states:
-                            X0_candidate = X0_candidate.T
-                        if np.isfinite(X0_candidate).all():
-                            X0_new = X0_candidate.flatten()
-                            break
-                    
+                    X0_new = _resample_valid_ic(config)
                     if X0_new is not None:
-                        # Replace in pool at the current position
                         if n_sol < X0_pool.shape[1]:
                             X0_pool[:, n_sol] = X0_new
                         else:
-                            # Need to extend pool
                             X0_pool = np.hstack([X0_pool, X0_new.reshape(-1, 1)])
 
             if verbose:
@@ -308,11 +259,7 @@ def generate(
 
 
 
-import os, json, hashlib
-import torch
-import numpy as np
-
-def _fingerprint(config, n_trajectories, controller, adaptive_sampling="gradient"):
+def _fingerprint(config, n_trajectories, controller):
     ctrl_name = controller.__class__.__name__ if controller is not None else "None"
 
     payload = dict(
@@ -326,13 +273,11 @@ def _fingerprint(config, n_trajectories, controller, adaptive_sampling="gradient
         t1_initial=config.t1_initial,
         t1_scale=config.t1_scale,
         t1_max=config.t1_max,
-        fp_tol=config.fp_tol,
         direct_n_init_nodes=config.direct_n_init_nodes,
         indirect_tol=config.indirect_tol,
         indirect_max_nodes=config.indirect_max_nodes,
 
         controller=ctrl_name,
-        adaptive_sampling=adaptive_sampling,
     )
     s = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha1(s).hexdigest(), payload
@@ -340,17 +285,15 @@ def _fingerprint(config, n_trajectories, controller, adaptive_sampling="gradient
 
 
 
-def load_or_generate(config, n_trajectories=None, *, controller=None, cache_dir=None, force_regen=False, val_split=0.2, adaptive_sampling="gradient", n_candidates=None, **kwargs):
+def load_or_generate(config, n_trajectories=None, *, controller=None, cache_dir=None, force_regen=False, val_split=0.2, n_candidates=None, adaptive_sampling=None, **kwargs):
     if n_trajectories is None:
         raise ValueError("n_trajectories must be set by the experiment (e.g. n_trajectories=500)")
-    if n_candidates is None:
-        raise ValueError("n_candidates must be set by the experiment (e.g. n_candidates=200)")
     if cache_dir is None:
         from problems import get_results_dir
         cache_dir = get_results_dir(config, "data")
     os.makedirs(cache_dir, exist_ok=True)
 
-    key, meta = _fingerprint(config, n_trajectories, controller, adaptive_sampling=adaptive_sampling)
+    key, meta = _fingerprint(config, n_trajectories, controller)
     path_train = os.path.join(cache_dir, f"pmp_{key}_train.npz")
     path_val = os.path.join(cache_dir, f"pmp_{key}_val.npz")
 
@@ -366,8 +309,6 @@ def load_or_generate(config, n_trajectories=None, *, controller=None, cache_dir=
     dataset, n_attempt, n_fail, sol_time, fail_time = generate(
         config.ocp, config, n_trajectories,
         controller=controller,
-        adaptive_sampling=adaptive_sampling,
-        n_candidates=n_candidates,
         **kwargs
     )
 

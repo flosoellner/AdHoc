@@ -1,117 +1,51 @@
 import os
 import numpy as np
 import torch
-from types import SimpleNamespace
-from controls.nn import GradNet
+from dataclasses import dataclass, replace, fields
+from typing import Optional
+from controls.nn import GradNet, Control
+from controls.train import TrainConfig
 
+# --- 1. Controller Configuration (Dataclass) ---
+@dataclass
+class ControllerConfig:
+    """Configuration for a single controller variant."""
+    enabled: bool = False
+    kind: str = "gradnet"
+    use_lqr: bool = True
+    train_mode: str = "unsupervised"
+    pretrain: bool = False
+    adaptive: bool = False
+    supervision: Optional[bool] = None
+
+# --- 2. Default Configurations ---
 DEFAULT_CONTROLLER_CONFIGS = {
-
-    "GradNet": {
-        "enabled": False,
-        "kind": "gradnet",
-        "use_lqr": False,
-        "train_mode": "unsupervised",
-        "adaptive": False,
-        "supervision": None,
-    },
-
-    "GradQRNet": {
-        "enabled": False,
-        "kind": "gradnet",
-        "use_lqr": True,
-        "train_mode": "unsupervised",
-        "adaptive": False,
-        "supervision": None,
-    },
-    "Sup GradQRNet": {
-        "enabled": False,
-        "kind": "gradnet",
-        "use_lqr": True,
-        "train_mode": "supervised",
-        "adaptive": False,
-        "supervision": None,
-    },
-    "GradQRNet (sup)": {
-        "enabled": False,
-        "kind": "gradnet",
-        "use_lqr": True,
-        "train_mode": "unsupervised",
-        "adaptive": False,
-        "supervision": True,
-    },
-
-
-    "GradQRNet (pre)": {
-        "enabled": False,
-        "kind": "gradnet",
-        "use_lqr": True,
-        "train_mode": "hybrid",
-        "adaptive": False,
-        "supervision": None,
-    },
-    "GradQRNet (pre/sup)": {
-        "enabled": False,
-        "kind": "gradnet",
-        "use_lqr": True,
-        "train_mode": "hybrid",
-        "adaptive": False,
-        "supervision": True,
-    },
-
-    "GradNet (sup/ad)": {
-        "enabled": False,
-        "kind": "gradnet",
-        "use_lqr": False,
-        "train_mode": "unsupervised",
-        "adaptive": True,
-        "supervision": True,
-    },
-
-    "GradQRNet (ad)": {
-        "enabled": False,
-        "kind": "gradnet",
-        "use_lqr": True,
-        "train_mode": "unsupervised",
-        "adaptive": True,
-        "supervision": None,
-    },
-    "GradQRNet (sup/ad)": {
-        "enabled": False,
-        "kind": "gradnet",
-        "use_lqr": True,
-        "train_mode": "unsupervised",
-        "adaptive": True,
-        "supervision": True,
-    },
-
-    "GradQRNet (pre/ad)": {
-        "enabled": False,
-        "kind": "gradnet",
-        "use_lqr": True,
-        "train_mode": "hybrid",
-        "adaptive": True,
-        "supervision": None,
-    },
-    "GradQRNet (sup/ad)": {
-        "enabled": False,
-        "kind": "gradnet",
-        "use_lqr": True,
-        "train_mode": "unsupervised",
-        "adaptive": True,
-        "supervision": True,
-    },
-    "GradQRNet (pre/sup/ad)": {
-        "enabled": False,
-        "kind": "gradnet",
-        "use_lqr": True,
-        "train_mode": "hybrid",
-        "adaptive": True,
-        "supervision": True,
-    },
-
+    "GradNet":                ControllerConfig(use_lqr=False, train_mode="unsupervised"),
+    "GradQRNet":              ControllerConfig(use_lqr=True,  train_mode="unsupervised"),
+    "Sup GradQRNet":          ControllerConfig(use_lqr=True,  train_mode="supervised"),
+    "GradQRNet (sup)":        ControllerConfig(use_lqr=True,  train_mode="unsupervised", supervision=True),
+    "GradQRNet (pre)":        ControllerConfig(use_lqr=True,  train_mode="unsupervised", pretrain=True),
+    "GradQRNet (pre/sup)":    ControllerConfig(use_lqr=True,  train_mode="unsupervised", pretrain=True, supervision=True),
+    "GradNet (sup/ad)":       ControllerConfig(use_lqr=False, train_mode="unsupervised", adaptive=True, supervision=True),
+    "GradQRNet (ad)":         ControllerConfig(use_lqr=True,  train_mode="unsupervised", adaptive=True),
+    "GradQRNet (sup/ad)":     ControllerConfig(use_lqr=True,  train_mode="unsupervised", adaptive=True, supervision=True),
+    "GradQRNet (pre/ad)":     ControllerConfig(use_lqr=True,  train_mode="unsupervised", pretrain=True, adaptive=True),
+    "GradQRNet (pre/sup/ad)": ControllerConfig(use_lqr=True,  train_mode="unsupervised", pretrain=True, adaptive=True, supervision=True),
 }
 
-def save_model(path, *, config, grad_net=None, value_net=None, extra=None, history=None):
+def get_default_controller_configs():
+    """Returns a deep copy of defaults to prevent mutable state bugs."""
+    return {k: replace(v) for k, v in DEFAULT_CONTROLLER_CONFIGS.items()}
+
+
+# Keys that belong to ControllerConfig vs TrainConfig (for splitting overrides)
+_CONTROLLER_KEYS = {f.name for f in fields(ControllerConfig)}
+_TRAIN_KEYS = None  # Lazy init after TrainConfig import
+
+
+# --- 3. Save / Load ---
+def save_model(path, *, config, grad_net=None, extra=None, history=None):
+    """Save model checkpoint (weights + history + metadata)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     ckpt = {
         "meta": {
@@ -122,25 +56,23 @@ def save_model(path, *, config, grad_net=None, value_net=None, extra=None, histo
             "extra": extra or {},
         },
         "grad_net": grad_net.state_dict() if grad_net is not None else None,
-        "value_net": value_net.state_dict() if value_net is not None else None,
     }
-    history_to_save = None if history is None else {
-        "iters": list(history["iters"]),
-        "loss": list(history["loss"]),
-    }
-    # Save phase information if present (for hybrid models)
-    if history is not None and "phase" in history:
-        history_to_save["phase"] = list(history["phase"])
-    # Save val_mse and n_sup_epochs if present
-    if history is not None and "val_mse" in history:
-        history_to_save["val_mse"] = list(history["val_mse"])
-    if history is not None and "n_sup_epochs" in history:
-        history_to_save["n_sup_epochs"] = int(history["n_sup_epochs"])
+    history_to_save = None
+    if history is not None:
+        history_to_save = {
+            "iters": list(history["iters"]),
+            "loss": list(history["loss"]),
+        }
+        if "phase" in history:
+            history_to_save["phase"] = list(history["phase"])
+        if "val_mse" in history:
+            history_to_save["val_mse"] = list(history["val_mse"])
     ckpt["history"] = history_to_save
     torch.save(ckpt, path)
 
 
 def load_gradnet(path, *, config, device="cpu"):
+    """Load model checkpoint. Returns (grad_net, meta, history)."""
     ckpt = torch.load(path, map_location=device, weights_only=False)
 
     if ckpt.get("grad_net") is None:
@@ -149,338 +81,164 @@ def load_gradnet(path, *, config, device="cpu"):
     sd = ckpt["grad_net"]
     sd = {k: v for k, v in sd.items() if not k.startswith("_physics.")}
 
-    has_sequential_style = any(k.startswith("net.0.") for k in sd.keys())
-
-
-
     grad_net = GradNet(config).to(device)
-
     grad_net.load_state_dict(sd, strict=True)
     grad_net.eval()
 
     hist = ckpt.get("history")
     if hist is not None:
-        hist_orig = hist  # Keep reference to original
-        hist = {"iters": np.asarray(hist["iters"]), "loss": np.asarray(hist["loss"])}
-        # Restore phase information if present (check original dict)
+        hist_orig = hist
+        hist = {"iters": np.asarray(hist_orig["iters"]), "loss": np.asarray(hist_orig["loss"])}
         if "phase" in hist_orig:
             hist["phase"] = np.asarray(hist_orig["phase"])
-        # Restore val_mse and n_sup_epochs if present (check original dict)
         if "val_mse" in hist_orig:
             hist["val_mse"] = np.asarray(hist_orig["val_mse"])
-        if "n_sup_epochs" in hist_orig:
-            hist["n_sup_epochs"] = int(hist_orig["n_sup_epochs"])
     return grad_net, ckpt.get("meta", {}), hist
 
 
-def train_or_load_gradnet(
-    *,
-    config,
-    kind: str,
-    use_lqr: bool,
-    train_mode: str,            # "supervised" | "unsupervised" | "hybrid"
-    adaptive: bool = False, 
-    supervision: bool | None = False,
-    train_loader=None,
-    val_loader=None,
-    train_cfg,
-    ckpt_dir: str = None,
-    force_retrain: bool = False,
-    device: str = "cpu",
-    data=None,
-    val_data=None,
-):
-    from controls.train import train_loop, loss_unified, make_loader_XG
-    from problems import get_results_dir
-    
-    if supervision is None:
-        supervision = False
-    if getattr(train_cfg, "batch_size", None) is None:
-        train_cfg.batch_size = config.n_states
-
-    if ckpt_dir is None:
-        ckpt_dir = get_results_dir(config, "saved_models")
-    
-    os.makedirs(ckpt_dir, exist_ok=True)
-    ckpt_path = os.path.join(
-        ckpt_dir,
-        f"{kind}_useLQR{int(use_lqr)}_{train_mode}_adapt{int(adaptive)}_sup{int(supervision)}"
-        f"_d{config.n_states}_m{config.n_controls}_seed{config.seed}.pt"
+def _ckpt_path(ckpt_dir, cfg, config, train_overrides=None):
+    """Build deterministic checkpoint filename from controller + problem config."""
+    base = (
+        f"{cfg.kind}_useLQR{int(cfg.use_lqr)}_{cfg.train_mode}"
+        f"_pre{int(cfg.pretrain)}_adapt{int(cfg.adaptive)}"
+        f"_sup{int(cfg.supervision or False)}"
+        f"_d{config.n_states}_m{config.n_controls}_seed{config.seed}"
     )
-
-    if (not force_retrain) and os.path.exists(ckpt_path):
-        grad_net, meta, history = load_gradnet(ckpt_path, config=config, device=device)
-        return (grad_net, meta, history)
-
-    grad_net = GradNet(config, use_lqr=use_lqr).to(device)
-
-    sup_cfg   = SimpleNamespace(**vars(train_cfg), epochs=train_cfg.sup_epochs,   lr=train_cfg.sup_lr)
-    unsup_cfg = SimpleNamespace(**vars(train_cfg), epochs=train_cfg.unsup_epochs, lr=train_cfg.unsup_lr)
-
-    history = None
-
-    # Create validation loader if validation data is provided
-    val_loader_actual = val_loader
-    if val_loader_actual is None and val_data is not None:
-        val_loader_actual = make_loader_XG(val_data, train_cfg, shuffle=False)
-
-    sup_loader = None
-    if supervision:
-        if data is None:
-            raise ValueError("supervision=True requires `data` (X,dVdX)")
-        sup_loader = make_loader_XG(data, train_cfg, shuffle=True)
-
-    if train_mode == "supervised":
-        if (train_loader is None) and (data is None):
-            raise ValueError("supervised requires either `data` or `train_loader`")
-        grad_net, history = train_loop(
-            grad_net,
-            train_loader if train_loader is not None else make_loader_XG(data, train_cfg),
-            loss_unified,
-            sup_cfg,
-            mode="supervised",
-            val_loader=val_loader_actual,
-        )
-
-    elif train_mode == "unsupervised":
-        # Calculate expected total iterations (same as hybrid would have)
-        # This ensures unsupervised-only plots end at the same point as hybrid
-        if data is not None:
-            sup_loader_temp = make_loader_XG(data, train_cfg, shuffle=True)
-            expected_sup_iters = train_cfg.sup_epochs * len(sup_loader_temp)
-        else:
-            # Estimate: if no data provided, use a default or estimate
-            # This shouldn't happen in normal usage, but handle gracefully
-            expected_sup_iters = 0
-        
-        expected_unsup_iters = train_cfg.unsup_epochs * train_cfg.unsup_n_steps
-        expected_total_iters = expected_sup_iters + expected_unsup_iters
-        
-        # unsupervised call:
-        grad_net, history = train_loop(
-            grad_net, None, loss_unified, unsup_cfg,
-            mode="unsupervised", config=config, adaptive=adaptive,
-            supervision=supervision, sup_loader=sup_loader, sup_every=1,
-            val_loader=val_loader_actual,
-        )
-        
-        # Offset so unsupervised-only ends at expected_total_iters (same as hybrid)
-        # Use actual iteration count in case it differs from expected
-        actual_unsup_iters = len(history["iters"])
-        # Calculate offset: unsupervised should end where hybrid would end
-        # If actual matches expected: offset = expected_sup_iters (correct!)
-        # If actual differs: still align end points correctly
-        start_offset = expected_total_iters - actual_unsup_iters
-        # Apply offset: now unsupervised-only iters start after sup_iters would end
-        history["iters"] = history["iters"] + start_offset
+    if train_overrides and "n_candidates" in train_overrides:
+        base += f"_nc{train_overrides['n_candidates']}"
+    return os.path.join(ckpt_dir, base + ".pt")
 
 
-    elif train_mode == "hybrid":
-        if data is None:
-            raise ValueError("hybrid requires data")
-
-        grad_net, hist_sup = train_loop(
-            grad_net,
-            make_loader_XG(data, train_cfg),
-            loss_unified,
-            sup_cfg,
-            mode="supervised",
-            supervision=supervision,
-            val_loader=val_loader_actual,
-        )
-        grad_net, hist_unsup = train_loop(
-            grad_net,
-            None,
-            loss_unified,
-            unsup_cfg,
-            mode="unsupervised",
-            config=config,
-            adaptive=adaptive,
-            supervision=supervision,
-            sup_loader=sup_loader,
-            sup_every=1,
-            val_loader=val_loader_actual,
-        )
-
-        # Combine supervised and unsupervised histories
-        it_sup, lo_sup = hist_sup["iters"], hist_sup["loss"]
-        it_uns, lo_uns = hist_unsup["iters"], hist_unsup["loss"]
-        offset = int(it_sup[-1]) if len(it_sup) else 0
-
-        history = {
-            "iters": np.concatenate([it_sup, it_uns + offset]),
-            "loss":  np.concatenate([lo_sup, lo_uns]),
-            "phase": np.array((["sup"] * len(it_sup)) + (["unsup"] * len(it_uns))),
-        }
-        
-        # Add validation MSE if available (and n_sup_epochs so val_mse plot can show unsup only)
-        if "val_mse" in hist_sup:
-            val_mse_sup = hist_sup["val_mse"]
-            val_mse_unsup = hist_unsup.get("val_mse", [])
-            if len(val_mse_unsup) > 0:
-                history["val_mse"] = np.concatenate([val_mse_sup, val_mse_unsup])
-                history["n_sup_epochs"] = len(val_mse_sup)
-            else:
-                history["val_mse"] = val_mse_sup
-
-    else:
-        raise ValueError("train_mode must be 'supervised', 'unsupervised', or 'hybrid'")
-
-    meta_out = {"kind": kind, "use_lqr": use_lqr, "train_mode": train_mode, "adaptive": adaptive, "supervision": supervision}
-    save_model(ckpt_path, config=config, grad_net=grad_net, value_net=None, extra=meta_out, history=history)
-
-    return (grad_net, meta_out, history)
-
-
-
-
+# --- 4. Training Entry Point ---
 def train_controllers_from_config(
-    controller_configs,
-    *,
-    config,
-    train_cfg,
+    controller_configs=None,
+    config=None,
+    train_cfg=None,
     data=None,
     val_data=None,
     device="cpu",
     verbose=True,
+    force_retrain=False,
 ):
     """
-    Train multiple controllers from a configuration dictionary.
-    
+    Trains one or multiple controllers based on the provided configuration.
+
+    Models are saved after training and loaded from cache on subsequent runs
+    (unless force_retrain=True).
+
     Parameters
     ----------
-    controller_configs : dict
-        Dictionary mapping controller names to their configurations.
-        Each config should have:
-        - "enabled": bool - whether to train this controller
-        - "kind": str - model kind ("gradnet", "resnet", etc.)
-        - "use_lqr": bool - whether to use LQR baseline
-        - "train_mode": str - "supervised", "unsupervised", or "hybrid"
-        - "adaptive": bool - whether to use adaptive batch sizing
-        - "supervision": bool - whether to use supervision in unsupervised mode
-    config : SimpleNamespace
-        Problem configuration
-    train_cfg : TrainConfig
-        Training configuration
-    data : dict, optional
-        Training data (required for supervised/hybrid modes)
-    val_data : dict, optional
-        Validation data for computing validation MSE
-    device : str, default "cpu"
-        Device to train on
-    verbose : bool, default True
-        Whether to print training progress
-        
-    Returns
-    -------
-    trained_models : dict
-        Dictionary mapping controller names to trained models
-    trained_controllers : dict
-        Dictionary mapping controller names to Control objects
-    histories : dict
-        Dictionary mapping controller names to training histories
+    controller_configs : dict, optional
+        Dictionary where keys are model names and values are config dicts.
+        If None, uses all DEFAULT_CONTROLLER_CONFIGS.
+        Partial updates are allowed (e.g., passing just {"GradNet": {"enabled": True}}).
+    force_retrain : bool, default False
+        If True, retrain even if a checkpoint exists.
     """
-    from controls.nn import Control
-    
+    from problems import get_results_dir
+    from controls.train import TrainConfig
+
+    global _TRAIN_KEYS
+    if _TRAIN_KEYS is None:
+        _TRAIN_KEYS = {f.name for f in fields(TrainConfig)}
+
+    defaults = get_default_controller_configs()
+    train_overrides_by_name = {}  # Per-controller TrainConfig overrides (e.g. n_candidates)
+
+    if controller_configs is None:
+        final_configs = defaults
+    else:
+        for name, override_cfg in controller_configs.items():
+            if not isinstance(override_cfg, dict):
+                if name not in defaults:
+                    defaults[name] = override_cfg
+                continue
+            # Split into controller vs train overrides
+            ctrl_overrides = {k: v for k, v in override_cfg.items() if k in _CONTROLLER_KEYS}
+            train_overrides = {k: v for k, v in override_cfg.items() if k in _TRAIN_KEYS}
+            if train_overrides:
+                train_overrides_by_name[name] = train_overrides
+
+            if name in defaults:
+                for k, v in ctrl_overrides.items():
+                    setattr(defaults[name], k, v)
+            else:
+                defaults[name] = ControllerConfig(**ctrl_overrides)
+        final_configs = defaults
+
+    active_configs = {
+        name: cfg for name, cfg in final_configs.items()
+        if cfg.enabled
+    }
+
+    if not active_configs:
+        if verbose: print("No controllers enabled. Exiting.")
+        return {}, {}, {}
+
+    ckpt_dir = get_results_dir(config, "saved_models")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
     trained_models = {}
     trained_controllers = {}
     histories = {}
-    
-    for name, cfg in controller_configs.items():
-        if not cfg.get("enabled", False):
+
+    if verbose:
+        print(f"Training {len(active_configs)} models on {device}...")
+
+    for name, cfg in active_configs.items():
+        path = _ckpt_path(ckpt_dir, cfg, config, train_overrides=train_overrides_by_name.get(name))
+
+        # Try loading from cache
+        if (not force_retrain) and os.path.exists(path):
+            if verbose:
+                print(f"\n--- Loading {name} from cache ---")
+            model, meta, history = load_gradnet(path, config=config, device=device)
+            trained_models[name] = model
+            trained_controllers[name] = Control(config, grad_net=model)
+            histories[name] = history
             continue
-        
+
         if verbose:
-            print(f"\n{'='*60}")
-            print(f"Training: {name}")
-            print(f"{'='*60}")
-        
-        model, meta, hist = train_or_load_gradnet(
+            print(f"\n--- Training {name} ---")
+            pre_str = " + pretrain" if cfg.pretrain else ""
+            print(f"Mode: {cfg.train_mode}{pre_str} | LQR: {cfg.use_lqr}")
+
+        model = GradNet(config, use_lqr=cfg.use_lqr).to(device)
+
+        from controls.train import train
+
+        # Merge per-controller train overrides (e.g. n_candidates) into base train_cfg
+        effective_train_cfg = train_cfg
+        if name in train_overrides_by_name:
+            effective_train_cfg = replace(train_cfg, **train_overrides_by_name[name])
+
+        history = train(
+            model,
             config=config,
-            kind=cfg["kind"],
-            use_lqr=cfg["use_lqr"],
-            train_mode=cfg["train_mode"],
-            adaptive=cfg["adaptive"],
-            supervision=cfg["supervision"],
-            train_cfg=train_cfg,
+            train_config=effective_train_cfg,
             data=data,
             val_data=val_data,
-            device=device,
+            mode=cfg.train_mode,
+            pretrain=cfg.pretrain,
+            supervision=cfg.supervision,
+            adaptive=cfg.adaptive,
         )
-        
-        ctrl = Control(config, grad_net=model)
-        
+
+        # Save checkpoint
+        meta_out = {
+            "kind": cfg.kind, "use_lqr": cfg.use_lqr, "train_mode": cfg.train_mode,
+            "pretrain": cfg.pretrain, "adaptive": cfg.adaptive,
+            "supervision": cfg.supervision,
+        }
+        save_model(path, config=config, grad_net=model, extra=meta_out, history=history)
+        if verbose:
+            print(f"  Saved to {path}")
+
         trained_models[name] = model
-        trained_controllers[name] = ctrl
-        histories[name] = hist
-    
+        trained_controllers[name] = Control(config, grad_net=model)
+        histories[name] = history
+
     return trained_models, trained_controllers, histories
 
-def get_default_controller_configs():
-    """Get a copy of the default controller configurations."""
-    import copy
-    return copy.deepcopy(DEFAULT_CONTROLLER_CONFIGS)
-
-def train_controllers(
-    *,
-    config,
-    train_cfg,
-    data=None,
-    val_data=None,
-    controller_configs=None,
-    device="cpu",
-    verbose=True,
-):
-    """
-    Train controllers using default configs or provided overrides.
-    
-    Parameters
-    ----------
-    config : SimpleNamespace
-        Problem configuration
-    train_cfg : TrainConfig
-        Training configuration
-    data : dict, optional
-        Training data (required for supervised/hybrid modes)
-    val_data : dict, optional
-        Validation data for computing validation MSE
-    controller_configs : dict, optional
-        Controller configurations. If None, uses defaults.
-        Can be a partial dict to override only specific controllers.
-        Use {"Model 3 (Hybrid)": {"enabled": True}} to enable just one.
-    device : str, default "cpu"
-        Device to train on
-    verbose : bool, default True
-        Whether to print training progress
-        
-    Returns
-    -------
-    trained_models : dict
-        Dictionary mapping controller names to trained models
-    trained_controllers : dict
-        Dictionary mapping controller names to Control objects
-    histories : dict
-        Dictionary mapping controller names to training histories
-    """
-    if controller_configs is None:
-        controller_configs = get_default_controller_configs()
-    else:
-        # Merge with defaults, allowing partial overrides
-        defaults = get_default_controller_configs()
-        for name, override_cfg in controller_configs.items():
-            if name in defaults:
-                defaults[name].update(override_cfg)
-            else:
-                defaults[name] = override_cfg
-        controller_configs = defaults
-    
-    return train_controllers_from_config(
-        controller_configs,
-        config=config,
-        train_cfg=train_cfg,
-        data=data,
-        val_data=val_data,
-        device=device,
-        verbose=verbose,
-    )
-
+# Alias used by notebooks
+train_controllers = train_controllers_from_config

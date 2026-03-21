@@ -1,4 +1,4 @@
-import inspect
+
 import warnings
 import numpy as np
 
@@ -8,206 +8,26 @@ from scipy.integrate import solve_bvp
 import sampling
 
 
+# --------------------------------------------------------------------------- #
+# Validation helpers
+# --------------------------------------------------------------------------- #
+
+def _is_finite(*arrays):
+    """Return True if every element in all arrays is finite."""
+    return all(np.isfinite(a).all() for a in arrays)
+
+
+# --------------------------------------------------------------------------- #
+# IVP solver (modified scipy — events without root-finding)
+# --------------------------------------------------------------------------- #
+
 def solve_ivp(
         fun, t_span, y0, method='RK45', t_eval=None, dense_output=False,
         events=None, vectorized=False, args=None, **options
     ):
-    """Solve an initial value problem for a system of ODEs.
-
-    Modification of scipy.integrate.solve_ivp check events only after each
-    solver step without root-finding. This makes event times less accurate but
-    computations faster and more robust.
-
-    This function numerically integrates a system of ordinary differential
-    equations given an initial value:
-        dy / dt = f(t, y)
-        y(t0) = y0
-    Here t is a 1-D independent variable (time), y(t) is an N-D vector-valued
-    function (state), and an N-D vector-valued function f(t, y) determines the
-    differential equations. The goal is to find y(t) approximately satisfying
-    the differential equations, given an initial value y(t0)=y0. Some of the
-    solvers support integration in the complex domain, but note that for stiff
-    ODE solvers, the right-hand side must be complex-differentiable (satisfy
-    Cauchy-Riemann equations [11]_). To solve a problem in the complex domain,
-    pass y0 with a complex data type. Another option always available is to
-    rewrite your problem for real and imaginary parts separately.
-
-    Parameters
-    ----------
-    fun : callable
-        Right-hand side of the system. The calling signature is ``fun(t, y)``.
-        Here `t` is a scalar, and there are two options for the ndarray `y`: It
-        can either have shape (n,); then `fun` must return array_like with shape
-        (n,). Alternatively, it can have shape (n, k); then `fun` must return an
-        array_like with shape (n, k), i.e., each column corresponds to a single
-        column in `y`. The choice between the two options is determined by
-        `vectorized` argument (see below). The vectorized implementation allows
-        a faster approximation of the Jacobian by finite differences (required
-        for stiff solvers).
-    t_span : 2-tuple of floats
-        Interval of integration (t0, tf). The solver starts with t=t0 and
-        integrates until it reaches t=tf.
-    y0 : array_like, shape (n,)
-        Initial state. For problems in the complex domain, pass `y0` with a
-        complex data type (even if the initial value is purely real).
-    method : string or `OdeSolver`, optional
-        Integration method to use:
-            * 'RK45' (default): Explicit Runge-Kutta method of order 5(4) [1]_.
-              The error is controlled assuming accuracy of the fourth-order
-              method, but steps are taken using the fifth-order accurate formula
-              (local extrapolation is done). A quartic interpolation polynomial
-              is used for the dense output [2]_. Can be applied in the complex
-              domain.
-            * 'RK23': Explicit Runge-Kutta method of order 3(2) [3]_. The error
-              is controlled assuming accuracy of the second-order method, but
-              steps are taken using the third-order accurate formula (local
-              extrapolation is done). A cubic Hermite polynomial is used for the
-              dense output. Can be applied in the complex domain.
-            * 'DOP853': Explicit Runge-Kutta method of order 8 [13]_.
-              Python implementation of the "DOP853" algorithm originally written
-              in Fortran [14]_. A 7-th order interpolation polynomial accurate
-              to 7-th order is used for the dense output. Can be applied in the
-              complex domain.
-            * 'Radau': Implicit Runge-Kutta method of the Radau IIA family of
-              order 5 [4]_. The error is controlled with a third-order accurate
-              embedded formula. A cubic polynomial which satisfies the
-              collocation conditions is used for the dense output.
-            * 'BDF': Implicit multi-step variable-order (1 to 5) method based
-              on a backward differentiation formula for the derivative
-              approximation [5]_. The implementation follows the one described
-              in [6]_. A quasi-constant step scheme is used and accuracy is
-              enhanced using the NDF modification. Can be applied in the complex
-              domain.
-            * 'LSODA': Adams/BDF method with automatic stiffness detection and
-              switching [7]_, [8]_. This is a wrapper of the Fortran solver from
-              ODEPACK.
-        You can also pass an arbitrary class derived from `OdeSolver` which
-        implements the solver.
-    t_eval : array_like, optional
-        Times at which to store the computed solution, must be sorted and lie
-        within `t_span`. If None (default), use points selected by the solver.
-    dense_output : bool, optional
-        Whether to compute a continuous solution. Default is False.
-    events : callable, or list of callables, optional
-        Events to track. If None (default), no events will be tracked. Each
-        function must have the signature ``event(t, y)`` and return a float. The
-        solver looks for a sign change over each time step, so if multiple zero
-        crossings occur within one step, events may be missed. Note that unlike
-        scipy.integrate.solve_ivp, the event time is not refined exactly with
-        any root-finding. Each `event` function might also have the following
-        attribute:
-            terminal: bool, optional
-                Whether to terminate integration if this event occurs.
-                Implicitly False if not assigned.
-            direction: float, optional
-                Direction of a zero crossing. If `direction` is positive,
-                `event` will only trigger when going from negative to positive,
-                and vice versa if `direction` is negative. If 0, then either
-                direction will trigger event. Implicitly 0 if not assigned.
-        You can assign attributes like ``event.terminal = True`` to any
-        function in Python.
-    vectorized : bool, optional
-        Whether `fun` is implemented in a vectorized fashion. Default is False.
-    args : tuple, optional
-        Additional arguments to pass to the user-defined functions.  If given,
-        the additional arguments are passed to all user-defined functions.
-        So if, for example, `fun` has the signature ``fun(t, y, a, b, c)``,
-        then `jac` (if given) and any event functions must have the same
-        signature, and `args` must be a tuple of length 3.
-    options
-        Options passed to a chosen solver. All options available for already
-        implemented solvers are listed below.
-    first_step : float or None, optional
-        Initial step size. Default is `None` which means that the algorithm
-        should choose.
-    max_step : float, optional
-        Maximum allowed step size. Default is np.inf, i.e., the step size is not
-        bounded and determined solely by the solver.
-    rtol, atol : float or array_like, optional
-        Relative and absolute tolerances. The solver keeps the local error
-        estimates less than ``atol + rtol * abs(y)``. Here `rtol` controls a
-        relative accuracy (number of correct digits), while `atol` controls
-        absolute accuracy (number of correct decimal places). To achieve the
-        desired `rtol`, set `atol` to be lower than the lowest value that can
-        be expected from ``rtol * abs(y)`` so that `rtol` dominates the
-        allowable error. If `atol` is larger than ``rtol * abs(y)`` the
-        number of correct digits is not guaranteed. Conversely, to achieve the
-        desired `atol` set `rtol` such that ``rtol * abs(y)`` is always lower
-        than `atol`. If components of y have different scales, it might be
-        beneficial to set different `atol` values for different components by
-        passing array_like with shape (n,) for `atol`. Default values are
-        1e-3 for `rtol` and 1e-6 for `atol`.
-    jac : array_like, sparse_matrix, callable or None, optional
-        Jacobian matrix of the right-hand side of the system with respect
-        to y, required by the 'Radau', 'BDF' and 'LSODA' method. The
-        Jacobian matrix has shape (n, n) and its element (i, j) is equal to
-        ``d f_i / d y_j``.  There are three ways to define the Jacobian:
-            * If array_like or sparse_matrix, the Jacobian is assumed to
-              be constant. Not supported by 'LSODA'.
-            * If callable, the Jacobian is assumed to depend on both
-              t and y; it will be called as ``jac(t, y)``, as necessary.
-              For 'Radau' and 'BDF' methods, the return value might be a
-              sparse matrix.
-            * If None (default), the Jacobian will be approximated by
-              finite differences.
-        It is generally recommended to provide the Jacobian rather than
-        relying on a finite-difference approximation.
-    jac_sparsity : array_like, sparse matrix or None, optional
-        Defines a sparsity structure of the Jacobian matrix for a finite-
-        difference approximation. Its shape must be (n, n). This argument
-        is ignored if `jac` is not `None`. If the Jacobian has only few
-        non-zero elements in *each* row, providing the sparsity structure
-        will greatly speed up the computations [10]_. A zero entry means that
-        a corresponding element in the Jacobian is always zero. If None
-        (default), the Jacobian is assumed to be dense.
-        Not supported by 'LSODA', see `lband` and `uband` instead.
-    lband, uband : int or None, optional
-        Parameters defining the bandwidth of the Jacobian for the 'LSODA'
-        method, i.e., ``jac[i, j] != 0 only for i - lband <= j <= i + uband``.
-        Default is None. Setting these requires your jac routine to return the
-        Jacobian in the packed format: the returned array must have ``n``
-        columns and ``uband + lband + 1`` rows in which Jacobian diagonals are
-        written. Specifically ``jac_packed[uband + i - j , j] = jac[i, j]``.
-        The same format is used in `scipy.linalg.solve_banded` (check for an
-        illustration).  These parameters can be also used with ``jac=None`` to
-        reduce the number of Jacobian elements estimated by finite differences.
-    min_step : float, optional
-        The minimum allowed step size for 'LSODA' method.
-        By default `min_step` is zero.
-
-    Returns
-    -------
-    Bunch object with the following fields defined:
-    t : ndarray, shape (n_points,)
-        Time points.
-    y : ndarray, shape (n, n_points)
-        Values of the solution at `t`.
-    sol : `OdeSolution` or None
-        Found solution as `OdeSolution` instance; None if `dense_output` was
-        set to False.
-    t_events : list of ndarray or None
-        Contains for each event type a list of arrays at which an event of
-        that type event was detected. None if `events` was None.
-    y_events : list of ndarray or None
-        For each value of `t_events`, the corresponding value of the solution.
-        None if `events` was None.
-    nfev : int
-        Number of evaluations of the right-hand side.
-    njev : int
-        Number of evaluations of the Jacobian.
-    nlu : int
-        Number of LU decompositions.
-    status : int
-        Reason for algorithm termination:
-            * -1: Integration step failed.
-            *  0: The solver successfully reached the end of `tspan`.
-            *  1: A termination event occurred.
-    message : string
-        Human-readable description of the termination reason.
-    success : bool
-        True if the solver reached the interval end or a termination event
-        occurred (``status >= 0``).
-    """
+    """Modified scipy.integrate.solve_ivp: checks events only after each solver
+    step (no root-finding). Event times are less accurate but computation is
+    faster and more robust. See scipy.integrate.solve_ivp for full docs."""
     t0, tf = map(float, t_span)
 
     if args is not None:
@@ -338,7 +158,8 @@ def solve_ivp(
 
 def sim_closed_loop(
         dynamics, jacobian, controller, tspan, X0, t_eval=None, events=None,
-        solver='LSODA', atol=1e-06, rtol=1e-03, sigma=0, dt_sde=None
+        solver='LSODA', atol=1e-06, rtol=1e-03, sigma=0, dt_sde=None,
+        converged_fn=None, check_every=1
     ):
     '''
     Simulate the closed-loop system for a fixed time interval.
@@ -356,36 +177,56 @@ def sim_closed_loop(
             dX = f(X,u) dt + sigma sqrt(dt) dW instead of deterministic ODE.
         dt_sde : float, optional
             Time step for Euler-Maruyama when sigma > 0. If None, use 1e-3.
+        converged_fn : callable(x, U) -> bool, optional
+            Early-stop callback checked every check_every steps (SDE only).
+        check_every : int, default=50
+            How often to call converged_fn during SDE integration.
 
     Returns
     -------
         t: time vector, (Nt,) numpy array
         X: state time series, (n,Nt) numpy array
-        status: 0 success, -1 failure
+        status: 0 success, 1 terminal event / explosion, -1 failure
     '''
     if sigma is not None and sigma > 0:
-        # Stochastic path: Euler-Maruyama dX = f dt + sigma sqrt(dt) dW
+        from scipy.optimize import fsolve
         dt = dt_sde if dt_sde is not None and dt_sde > 0 else 1e-3
         t0, t1 = tspan[0], tspan[1]
         n_steps = max(1, int(np.ceil((t1 - t0) / dt)))
-        dt = (t1 - t0) / n_steps  # exact step so last point is t1
+        dt = (t1 - t0) / n_steps
         t = np.linspace(t0, t1, n_steps + 1)
         x = np.asarray(X0).flatten().astype(float)
         n = x.size
-        X_list = [x.copy()]
+        noise = sigma * np.sqrt(dt)
+        X_arr = np.empty((n, n_steps + 1))
+        X_arr[:, 0] = x
+        last_k = 0
         for k in range(n_steps):
+            dW = np.random.standard_normal(n)
+            b = x + noise * dW
+
+            def residual(z):
+                z = np.asarray(z).ravel()
+                U = controller.eval_U(z)
+                f = np.asarray(dynamics(z, U)).ravel()
+                return z - dt * f - b
+
+            try:
+                x, info, ier, msg = fsolve(residual, x, full_output=True)
+                x = np.asarray(x).ravel()
+                if ier != 1 or not np.isfinite(x).all():
+                    X_arr[:, k+1] = x
+                    return t[:k+2], X_arr[:, :k+2], -1
+            except (ValueError, RuntimeError):
+                return t[:k+1], X_arr[:, :k+1], -1
+
+            X_arr[:, k+1] = x
+            last_k = k + 1
             U = controller.eval_U(x)
-            f = dynamics(x, U)
-            f = np.asarray(f).flatten()
-            if f.size != n:
-                return t[: len(X_list)], np.column_stack(X_list), -1
-            dW = np.random.normal(0, 1, size=n)
-            x = x + f * dt + sigma * np.sqrt(dt) * dW
-            if not np.isfinite(x).all():
-                return t[: len(X_list)], np.column_stack(X_list), -1
-            X_list.append(x.copy())
-        X = np.column_stack(X_list)
-        return t, X, 0
+            if converged_fn is not None and (k + 1) % check_every == 0:
+                if converged_fn(x, U):
+                    return t[:last_k+1], X_arr[:, :last_k+1], 0
+        return t[:last_k+1], X_arr[:, :last_k+1], 0
 
     # Deterministic path (unchanged)
     def dynamics_wrapper(t, X):
@@ -430,16 +271,19 @@ def sim_to_converge(
 
     # Solves over an extended time interval if needed to make ||f(x,u)|| -> 0
     while not converged and t[-1] < config.t1_max:
-        # Validate current state before simulation
         X_current = X[:,-1].flatten()
-        if not np.isfinite(X_current).all():
-            # State became non-finite, simulation failed
+        if not _is_finite(X_current):
             break
         
         t1 = np.maximum(config.t1_initial, t[-1] * config.t1_scale)
         
+        def _conv_check(x, U):
+            return bool(config.ocp.convergence(
+                x.reshape(-1, 1), np.asarray(U).reshape(-1, 1),
+                config.conv_tol, config.fp_tol
+            ))
+
         try:
-            # Simulate the closed-loop system
             t_new, X_new, status = sim_closed_loop(
                 dynamics,
                 jacobian,
@@ -451,15 +295,14 @@ def sim_to_converge(
                 atol=1e-06,
                 rtol=1e-03,
                 sigma=sigma,
-                dt_sde=dt_sde
+                dt_sde=dt_sde,
+                converged_fn=_conv_check if (sigma and sigma > 0) else None,
             )
         except (ValueError, RuntimeError) as e:
             # Simulation failed (likely non-finite state)
             break
 
-        # Validate the new state
-        if not np.isfinite(X_new).all():
-            # Simulation produced non-finite values, stop
+        if not _is_finite(X_new):
             break
 
         t = np.concatenate((t, t_new[1:]))
@@ -468,24 +311,20 @@ def sim_to_converge(
         if status == 1:
             break
 
-        # Validate state before computing convergence
-        if not np.isfinite(X[:,-1]).all():
+        if not _is_finite(X[:,-1]):
             break
-            
+
         try:
             U = controller.eval_U(X[:,-1])
-            if not np.isfinite(U).all():
+            if not _is_finite(U):
                 break
-            converged = np.linalg.norm(dynamics(X[:,-1], U)) < config.fp_tol
+            converged = bool(config.ocp.convergence(X[:,-1:], U, config.conv_tol, config.fp_tol))
         except (ValueError, RuntimeError):
-            # Failed to compute control or dynamics
             break
 
     return t, X, converged
 
-import numpy as np
 from tqdm import tqdm
-
 
 
 def monte_carlo(
@@ -566,9 +405,6 @@ def monte_carlo(
             raise ValueError("n_MC must be set by the experiment (e.g. n_MC=100)")
         np.random.seed(random_seed)
         X0_pool = sampling.sample_conditions(config, n_MC, **sample_kw)
-        bad = ~np.isfinite(X0_pool)
-        bad_cols = np.where(bad.any(axis=0))[0]
-        bad_cols[:10], len(bad_cols)
     else:
         # If X0_pool is provided, use its actual size
         n_MC = X0_pool.shape[1]  # X0_pool is (n_states, n_samples)
@@ -586,13 +422,8 @@ def monte_carlo(
     opt_final_times = np.full_like(NN_final_times, -1.)
     opt_costs = np.full_like(NN_costs, -1.)
 
-    def closed_converged(X, U):
-        # Check both: dynamics are small AND state is near zero
-        dynamics_small = np.linalg.norm(OCP.dynamics(X, U), axis=0) < config.fp_tol
-        state_near_zero = OCP.norm(X) < 0.01  # Threshold for "near zero" - adjust as needed
-        return dynamics_small & state_near_zero
-    def open_converged(X, U):
-        return OCP.running_cost(X, U) < config.fp_tol
+    def converged(X, U):
+        return OCP.convergence(X, U, config.conv_tol, config.fp_tol)
 
     events = OCP.make_integration_events()
 
@@ -601,112 +432,64 @@ def monte_carlo(
     for i in tqdm(range(n_MC)):
         X0 = X0_pool[:,i].flatten()  # Ensure 1D array
         
-        # Validate X0 before simulation
-        if not np.isfinite(X0).all():
-            # Invalid X0 - mark as failed but don't skip
+        if not _is_finite(X0):
             init_dists[i] = np.nan
-            # final_dists, NN_final_times, NN_costs already set to inf/nan
             continue
         
         init_dists[i] = OCP.norm(X0)
         
-        # Integrates the closed-loop system
         simulation_failed = False
         try:
             t, X, ode_converged = sim_to_converge(
                 OCP.dynamics, OCP.closed_loop_jacobian, controller, X0, config,
                 events=events, sigma=sigma, dt_sde=dt_sde
             )
-            
-            # Check if simulation produced valid results
-            if not np.isfinite(X).all():
-                # Simulation produced non-finite values - difficult IC
+            if not _is_finite(X):
                 simulation_failed = True
-                
-        except (ValueError, RuntimeError) as e:
-            # Simulation failed - difficult IC, not an error
+        except (ValueError, RuntimeError):
             simulation_failed = True
-        
+
         if simulation_failed:
-            # Mark as not converged (values already inf/nan)
-            # This is just a difficult initial condition
             continue
         
-        # If we get here, simulation succeeded
         try:
             V, dVdX, U = controller.bvp_guess(X)
-        except Exception as e:
-            # bvp_guess failed - still count as simulation succeeded but can't use for OCP
+        except Exception:
             V, dVdX, U = None, None, None
-        
-        # Check if controls are valid before proceeding
-        # Invalid controls indicate the controller failed, so don't count as converged
+
         if U is None:
-            # Invalid controls - mark as not converged
-            # final_dists, NN_final_times, NN_costs already set to inf/nan
             continue
-        
-        # Ensure U is a numpy array and check for invalid values
         U = np.asarray(U)
-        if U.size == 0 or not np.isfinite(U).all():
-            # Invalid controls - mark as not converged
+        if U.size == 0 or not _is_finite(U):
             continue
-        
-        # Check if U has the right shape (should be (n_controls, n_timepoints) or (n_controls,))
-        # bvp_guess should return U with shape matching X: (n_controls, n_timepoints)
+
+        # Ensure U is (n_controls, n_timepoints)
         if U.ndim == 1:
-            # Reshape to (n_controls, 1) for consistency if it's a single control vector
             if U.shape[0] == OCP.n_controls:
                 U = U.reshape(-1, 1)
             else:
-                # Wrong number of controls - mark as not converged
                 continue
-        elif U.ndim == 2:
-            if U.shape[0] != OCP.n_controls:
-                # Wrong number of controls - mark as not converged
-                continue
-            # U.shape[1] should match X.shape[1] (number of time points), but we'll let
-            # clip_trajectory handle that - if shapes don't match, it will fail gracefully
-        else:
-            # Invalid dimensionality - mark as not converged
+        elif U.ndim == 2 and U.shape[0] != OCP.n_controls:
+            continue
+        elif U.ndim > 2:
             continue
         
-        k, converged_flag = clip_trajectory(t, X, U, closed_converged)
-        
+        k, converged_flag = clip_trajectory(t, X, U, converged)
 
-        
-        # Only mark as converged if both ode_converged AND converged_flag are True
-        # This ensures the trajectory actually reached a valid equilibrium with valid controls
-        if ode_converged and converged_flag:
-            # Use the final state of the trajectory (X[:,-1]) which should be closest to equilibrium
-            # The trajectory continues after the first convergence point, so the final state is more accurate
-            if X.shape[1] > 0:
-                X_final = X[:,-1]  # Final state of the trajectory
-                final_dists_arr = OCP.norm(X_final)
-                # Extract scalar from array
-                final_dists[i] = float(final_dists_arr.flat[0] if final_dists_arr.size > 0 else 0.0)
-                
-
-            else:
-                final_dists[i] = np.inf
-            
+        if ode_converged and converged_flag and X.shape[1] > 0:
+            final_dists_arr = OCP.norm(X[:, -1])
+            final_dists[i] = float(final_dists_arr.flat[0] if final_dists_arr.size > 0 else 0.0)
             NN_final_times[i] = t[k]
             try:
                 NN_costs[i] = OCP.compute_cost(t, X, U).flatten()[-1]
-                # Double-check that cost is valid
                 if not np.isfinite(NN_costs[i]):
                     NN_final_times[i] = np.inf
                     NN_costs[i] = np.inf
             except Exception:
-                # Cost computation failed - mark as not converged
                 NN_final_times[i] = np.inf
                 NN_costs[i] = np.inf
         else:
-            # Not converged - ensure final_dists is set to inf (not uninitialized garbage)
             final_dists[i] = np.inf
-            # DEBUG
-            if i < 3:
-                print(f"Trajectory {i} NOT converged - final_dists[{i}] = inf")
 
         # -------------------------------------------------------------------- #
 
@@ -725,7 +508,7 @@ def monte_carlo(
                 ocp_sol = cont_ocp_sol(t)
 
                 k, _ = clip_trajectory(
-                    t, ocp_sol['X'], ocp_sol['U'], open_converged
+                    t, ocp_sol['X'], ocp_sol['U'], converged
                 )
 
                 opt_costs[i] = ocp_sol['V'].flatten()[0]
@@ -800,6 +583,7 @@ def monte_carlo_nu_mismatch(
         "t1_initial": getattr(config_baseline, "t1_initial", None),
         "t1_max": getattr(config_baseline, "t1_max", None),
         "fp_tol": getattr(config_baseline, "fp_tol", None),
+        "conv_tol": getattr(config_baseline, "conv_tol", None),
     }
     overrides = {k: v for k, v in overrides.items() if v is not None}
     config_eval = create_config(**overrides)
@@ -832,7 +616,7 @@ class OpenLoopSolver:
     def continuous_sol(self, t):
         raise NotImplementedError
 
-    def check_converged(self, tol):
+    def check_converged(self, conv_tol, fp_tol):
         raise NotImplementedError
 
     def extend_horizon(self):
@@ -884,17 +668,8 @@ class IndirectSolver(OpenLoopSolver):
 
         return {'X': X, 'U': U, 'dVdX': dVdX, 'V': V}
 
-    def check_converged(self, tol):
-        '''
-        Check if the running cost L and vector field F at final time are smaller
-        than a given tolerance, to see if the BVP is converged.
-
-        Parameters
-        ----------
-
-        Returns
-        -------
-        '''
+    def check_converged(self, conv_tol, fp_tol):
+        """True if running cost < conv_tol and dynamics norm < fp_tol at final time."""
         if self.bvp_sol is None or not self.bvp_sol.success:
             return False
 
@@ -902,7 +677,7 @@ class IndirectSolver(OpenLoopSolver):
         F = self.OCP.bvp_dynamics(self.sol['t'][-1:], self.bvp_sol.y[:,-1:])
         F = np.linalg.norm(F[:self.OCP.n_states])
 
-        return L <= tol and F <= tol
+        return L <= conv_tol and F <= fp_tol
 
     def extend_horizon(self):
         if self.bvp_sol is None:
@@ -984,13 +759,7 @@ def solve_ocp(
         )
 
     def _converged():
-        if getattr(config, 'system', None) == 'eikonal':
-            # Stationary HJB: success + small residual; skip L<=tol (running cost)
-            if solver.bvp_sol is None or not solver.bvp_sol.success:
-                return False
-            F = OCP.bvp_dynamics(solver.sol['t'][-1:], solver.bvp_sol.y[:, -1:])
-            return np.linalg.norm(F[:OCP.n_states]) <= config.fp_tol
-        return solver.check_converged(config.fp_tol)
+        return solver.check_converged(conv_tol=config.conv_tol, fp_tol=config.fp_tol)
 
     with warnings.catch_warnings():
         if suppress_warnings:

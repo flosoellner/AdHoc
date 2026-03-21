@@ -45,20 +45,6 @@ class LQR:
         U = self.U_bar - np.matmul(self.K, X_err)
         return U.flatten() if X.ndim < 2 else U
 
-    def control(self, X):
-        '''Control U(X) = U_bar - K*(X - X_bar)'''
-        return self.eval_U(X)
-
-    def value_gradient(self, X):
-        '''Value gradient dV/dX(X) = 2*P*(X - X_bar)'''
-        return self.eval_dVdX(X)
-
-    def Vx(self, X):
-        '''Value gradient dV/dX(X) = 2*P*(X - X_bar)'''
-        X_err = X.reshape(X.shape[0], -1) - self.X_bar
-        PX = 2. * np.matmul(self.P, X_err)
-        return PX.reshape(X.shape)
-
     def eval_dUdX(self, X):
         '''Control Jacobian dU/dX = -K'''
         if X.ndim < 2:
