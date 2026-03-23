@@ -14,15 +14,15 @@ def get_default_config():
     return {
         "n_controls": 4,
         "L": 2 * np.pi,
-        "t1_initial": 3,
+        "t1_initial": 5,
         "t1_scale": 6 / 5,
-        "t1_max": 10.0,
+        "t1_max": 20.0,
         "n_states": 96,
-        "nu": 0.25,    # strong nonlinearity: chaotic transients
+        "nu": 0.255,    # strong nonlinearity: chaotic transients
         "R": 0.5,         # higher penalty: LQR is slower, chaos lives longer
         "control_width": 0.2,
-        "ic_modes": 4,
-        "ic_scale": 0.75,
+        "ic_modes": 3,
+        "ic_scale": 2,
         "ic_use_sine": True,
         "ic_use_cosine": True,
         "fp_tol": 0.05,
@@ -114,27 +114,6 @@ class KSOCP(BaseOCP):
 
         self.B = self._B
 
-        # --- Diagnostic: instability spectrum ---
-        A_no_alpha = -self.nu * self.D4 - self.D2
-        eigs_ks = np.sort(np.linalg.eigvals(A_no_alpha).real)
-        eigs_full = np.sort(np.linalg.eigvals(self._A).real)
-        print(f"KS only (top 5):  {eigs_ks[-5:]}")
-        print(f"KS + alpha (top 5): {eigs_full[-5:]}")
-        print(f"Number unstable (KS only):  {np.sum(eigs_ks > 0)}")
-        print(f"Number unstable (KS + alpha): {np.sum(eigs_full > 0)}")
-
-        K_lqr = self.LQR.K
-        A_cl = self._A - self._B @ K_lqr
-        eigs_cl = np.sort(np.linalg.eigvals(A_cl).real)
-        print(f"Closed-loop (top 5): {eigs_cl[-5:]}")
-        print(f"Closed-loop stable: {np.all(eigs_cl < 0)}")
-
-        # Stabilizability check
-        eigs, vecs = np.linalg.eig(self._A)
-        unstable_idx = np.where(eigs.real > 1e-10)[0]
-        V_unstable = vecs[:, unstable_idx].real
-        C_tilde = V_unstable.T @ self._B
-        print(f"Stabilizability matrix rank: {np.linalg.matrix_rank(C_tilde)} / {len(unstable_idx)}")
 
     def dynamics(self, X, U):
         """

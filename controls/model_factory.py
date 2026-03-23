@@ -67,6 +67,8 @@ def save_model(path, *, config, grad_net=None, extra=None, history=None):
             history_to_save["phase"] = list(history["phase"])
         if "val_mse" in history:
             history_to_save["val_mse"] = list(history["val_mse"])
+        if "mean_dt" in history:
+            history_to_save["mean_dt"] = list(np.asarray(history["mean_dt"]).astype(float))
     ckpt["history"] = history_to_save
     torch.save(ckpt, path)
 
@@ -93,6 +95,8 @@ def load_gradnet(path, *, config, device="cpu"):
             hist["phase"] = np.asarray(hist_orig["phase"])
         if "val_mse" in hist_orig:
             hist["val_mse"] = np.asarray(hist_orig["val_mse"])
+        if "mean_dt" in hist_orig:
+            hist["mean_dt"] = np.asarray(hist_orig["mean_dt"], dtype=float)
     return grad_net, ckpt.get("meta", {}), hist
 
 

@@ -17,7 +17,7 @@ def get_default_config():
         "n_controls": 1,
         "t1_initial": 10,
         "t1_scale": 6 / 5,
-        "t1_max": 60.0,
+        "t1_max": 30.0,
         "nu": 0.1,
         "control_width": 0.4,
         "ic_modes": 9,  

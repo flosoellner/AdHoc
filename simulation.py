@@ -368,6 +368,9 @@ def monte_carlo(
     -------
     If single controller: results_dict (as before)
     If list of controllers: dict with keys as controller names, values as results_dict
+
+    Each results dict includes ``X0_pool`` (shape ``(n_states, n_MC)``), a copy of the
+    initial conditions used so a later run can pass ``X0_pool=...`` for identical ICs.
     '''
 
     if dist is None and X0_distance is not None:
@@ -523,7 +526,7 @@ def monte_carlo(
 
     results_dict = {
         'seed': random_seed,
-        #'X0_pool': X0_pool,
+        'X0_pool': np.asarray(X0_pool, dtype=float).copy(),
         'init_dists': init_dists,
         'final_dists': final_dists,
         'NN_final_times': NN_final_times,

@@ -1,27 +1,27 @@
-# ADHOC: Adaptive Hybrid Learning for Optimal Control
+# AdHOC — Adaptive Hybrid Optimal Control
 
-This repository contains the implementation of the **ADHOC** (Adaptive Hybrid Learning for Optimal Control) framework, as developed in the Master's Thesis: *"Adaptive Hybrid Learning for Optimal Control"* (Humboldt-Universität zu Berlin, 2026).
+Code for the **AdHOC** (Adaptive Hybrid Optimal Control) pipeline from the Master's thesis *Adaptive Hybrid Learning for Optimal Control* (Humboldt-Universität zu Berlin, 2026).
 
 The framework addresses the curse of dimensionality in high-dimensional Hamilton–Jacobi–Bellman (HJB) equations by combining supervised data from Pontryagin's Maximum Principle (PMP) with unsupervised physics-informed learning.
 
 ## Core methodology
 
-The AdHOC framework is built on three pillars:
+The method is built on three pillars (see thesis Chapter 3):
 
 1. **LQR-residual architecture:** The model learns a nonlinear residual relative to a locally optimal Linear–Quadratic Regulator (LQR) baseline, ensuring local stability at the equilibrium.
 
 2. **Unsupervised training with optional pretraining:** Physics-informed HJB minimisation, optionally preceded by supervised pretraining on PMP-generated costate data.
 
-3. **Adaptive sampling:** Steepness-aware importance sampling that concentrates training on dynamically challenging regions of the state space.
+3. **Adaptive sampling:** Residual-norm–weighted selection of rollout initial conditions (candidate pool size \(N_{\mathrm{cand}}\), batch \(|\mathcal{B}|\)).
 
 ## Structure
 
-- **`problems/`** — Nonlinear PDE benchmarks: Burgers equation, Allen–Cahn equation, Korteweg–de Vries (KdV).
-- **`controls/`** — LQR-residual gradient learning: `lqr.py`, `nn.py`, `train.py`, `model_factory.py`.
-- **`data.py`** — PMP-based data generation (BVP solves) for supervised pretraining.
-- **`simulation.py`** — Closed-loop rollout and Monte Carlo evaluation.
-- **`figures.py`** — Thesis-ready LaTeX tables and plots.
-- **`experiments/`** — Jupyter notebooks for Burgers and Allen–Cahn experiments.
+- **`problems/`** — Collocated PDE models: Burgers, Allen–Cahn, Kuramoto–Sivashinsky.
+- **`controls/`** — LQR baseline, residual networks, `train.py`, `model_factory.py`.
+- **`data.py`** — PMP / BVP data generation where applicable.
+- **`simulation.py`** — Closed-loop integration and Monte Carlo evaluation (optional shared `X0_pool` across runs).
+- **`figures.py`** — LaTeX tables (config, training hyperparameters including \(\Delta t_{\min},\Delta t_{\max}\), Monte Carlo with \(\pm\) SE) and plots; default output root is `experiments/results/{system}/seed_{seed}/`.
+- **`experiments.ipynb`** — End-to-end experiments at repo root; the **`experiments/`** package exposes `create_config` and re-exports `figures`.
 
 ## Installation
 
@@ -32,7 +32,7 @@ pip install -e .
 
 ## Usage
 
-Training is unsupervised (HJB residual along rollouts), with an optional supervised pretraining phase on PMP-generated state–costate pairs (`pretrain=True`). Run the notebooks in `experiments/` (e.g. `burgers.ipynb`, `allen_cahn.ipynb`) from the project root or from the `experiments` directory.
+Training is primarily unsupervised (HJB residual on rollouts), with optional supervised pretraining or a supervised *penalty* on PMP data (`TrainConfig`, `controller_configs` in the notebook). Run `experiments.ipynb` from the **repository root** so paths resolve. Copy or symlink generated assets into your thesis tree if it expects `\input{figures/results/...}` (Chapter~4).
 
 ```python
 from experiments import create_config

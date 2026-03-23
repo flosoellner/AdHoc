@@ -11,7 +11,7 @@ import itertools
 @dataclass
 class TrainConfig:
     sup_epochs: int = 1
-    sup_lr: float = 1e-3
+    sup_lr: float = 1e-4
     rollouts: int = 5
     unsup_lr: float = 1e-3
     batch_size: int = None
@@ -98,12 +98,14 @@ def _log_rollout(rollout_idx, n_rollouts, sum_total, sum_hjb, sum_sup, n, cfg, v
     )
 
 
-def _build_history(iters, losses, phases, val_mses, batch_size=1):
+def _build_history(iters, losses, phases, val_mses, batch_size=1, mean_dts=None):
     """Assemble the history dict returned by train_loop."""
     history = {"iters": np.asarray(iters), "loss": np.asarray(losses), "phase": np.asarray(phases),
                "batch_size": int(batch_size) if batch_size is not None else 1}
     if val_mses:
         history["val_mse"] = np.asarray(val_mses)
+    if mean_dts is not None:
+        history["mean_dt"] = np.asarray(mean_dts, dtype=float)
     return history
 
 
@@ -136,6 +138,7 @@ def train_loop(
 
     iters, losses, phases, step = [], [], [], 0
     val_mses = []
+    mean_dts = []
 
     if mode == "supervised":
         if loader is None:
@@ -152,7 +155,7 @@ def train_loop(
             for batch in loader:
                 batch = tuple(b.to(cfg.device) for b in batch)
 
-                loss, hjb_err, sup_err, _, _ = loss_fn(
+                loss, hjb_err, sup_err, _, _, _ = loss_fn(
                     model, batch,
                     mode="supervised",
                     supervision=supervision if supervision is not None else False,
@@ -177,6 +180,7 @@ def train_loop(
             iters.append(step)
             losses.append(sum_total / n if n > 0 else 0.0)
             phases.append("sup")
+            mean_dts.append(float("nan"))
 
             val_mse = _compute_val_mse(model, val_loader, cfg.device)
             if val_mse is not None:
@@ -184,7 +188,7 @@ def train_loop(
 
             _log_epoch(ep, sum_total, sum_hjb, sum_sup, n, cfg, val_mse)
 
-        return model, _build_history(iters, losses, phases, val_mses, cfg.batch_size)
+        return model, _build_history(iters, losses, phases, val_mses, cfg.batch_size, mean_dts)
 
     if config is None:
         raise ValueError("unsupervised mode requires `config`")
@@ -230,7 +234,7 @@ def train_loop(
         X_np = sample_X()
         X = torch.tensor(X_np.T, dtype=torch.float32, device=cfg.device)
 
-        loss, hjb_err, sup_err, conv_frac, dt_range = loss_fn(
+        loss, hjb_err, sup_err, conv_frac, dt_range, mean_dt = loss_fn(
             model, (X,), mode=mode, supervision=False,
             lambda_hjb=1.0,
             lambda_sup=lambda_sup_current,
@@ -240,7 +244,7 @@ def train_loop(
         if supervision and (sup_iter is not None):
             Xs, Gs = next(sup_iter)
             Xs = Xs.to(cfg.device); Gs = Gs.to(cfg.device)
-            _, _, sup_only, _, _ = loss_fn(
+            _, _, sup_only, _, _, _ = loss_fn(
                 model, (Xs, Gs), mode=mode, supervision=True,
                 lambda_hjb=1.0, lambda_sup=lambda_sup_current,
                 **rollout_kw,
@@ -270,6 +274,7 @@ def train_loop(
         iters.append(step)
         losses.append(float(loss.item()))
         phases.append("unsup")
+        mean_dts.append(float(mean_dt) if mean_dt is not None else float("nan"))
         bs = X.shape[0]
         sum_total += float(loss.item()) * bs
         sum_hjb   += float(hjb_err.item()) * bs
@@ -287,7 +292,7 @@ def train_loop(
             val_mse, conv_pct, dt_range_final,
         )
 
-    return model, _build_history(iters, losses, phases, val_mses, cfg.batch_size)
+    return model, _build_history(iters, losses, phases, val_mses, cfg.batch_size, mean_dts)
 
 
 
@@ -310,14 +315,20 @@ def hjb_parts(model, X: torch.Tensor):
     return dVdX, u, f, L
 
 def _hjb_rollout(model, X, horizon, dt_min, dt_max):
-    """Forward-rollout HJB error accumulation. Returns (scalar mean error, frac_converged, dt_range).
-    dt_range is (dt_min_used, dt_max_used) over all steps/samples, or None if no steps taken."""
+    """Forward-rollout HJB error accumulation.
+
+    Returns (scalar mean error, frac_converged, dt_range, mean_dt).
+    dt_range is (dt_min_used, dt_max_used) over all steps/samples, or None if no steps taken.
+    mean_dt is the mean of per-trajectory step sizes over all integration steps (active samples only).
+    """
     ocp = model.config.ocp
     x = X
     err = X.new_zeros(X.shape[0])
     converged = X.new_zeros(X.shape[0], dtype=torch.bool)
     actual_steps = 0
     dt_min_used, dt_max_used = float("inf"), float("-inf")
+    sum_dt = 0.0
+    n_dt = 0
     for step in range(horizon):
         dVdX, _, f, L = hjb_parts(model, x)
         if f.shape != x.shape:
@@ -338,12 +349,16 @@ def _hjb_rollout(model, X, horizon, dt_min, dt_max):
         H = L + (dVdX * f).sum(dim=1)
         active = ~converged
         err[active] += (H[active] ** 2) * dt[active]
+        if bool(active.any().item()):
+            sum_dt += float(dt[active].sum().item())
+            n_dt += int(active.sum().item())
         x = x + f * dt.unsqueeze(1)
         actual_steps = step + 1
     frac = float(converged.float().mean().item())
     hjb_mean = err.mean() / actual_steps if actual_steps > 0 else X.new_tensor(0.0)
     dt_range = (dt_min_used, dt_max_used) if actual_steps > 0 else None
-    return hjb_mean, frac, dt_range
+    mean_dt = (sum_dt / n_dt) if n_dt > 0 else None
+    return hjb_mean, frac, dt_range, mean_dt
 
 
 def loss_unified(
@@ -372,12 +387,13 @@ def loss_unified(
 
     conv_frac = None
     dt_range = None
+    mean_dt = None
     if (mode == "unsupervised") and (not supervision) and (horizon is not None):
-        rollout_err, conv_frac, dt_range = _hjb_rollout(model, X, horizon, dt_min, dt_max)
+        rollout_err, conv_frac, dt_range, mean_dt = _hjb_rollout(model, X, horizon, dt_min, dt_max)
         hjb_err = hjb_err + rollout_err
 
     total = lambda_hjb * hjb_err + lambda_sup * sup_err
-    return total, hjb_err, sup_err, conv_frac, dt_range
+    return total, hjb_err, sup_err, conv_frac, dt_range, mean_dt
 
 
 def train(model, config=None, train_config=None, data=None, val_data=None,
@@ -425,6 +441,9 @@ def train(model, config=None, train_config=None, data=None, val_data=None,
         if "val_mse" in h_pre:
             v2 = h_unsup.get("val_mse", [])
             history["val_mse"] = np.concatenate([h_pre["val_mse"], v2]) if np.size(v2) else h_pre["val_mse"]
+        m_pre = np.full(len(h_pre["iters"]), np.nan, dtype=float)
+        m_un = h_unsup.get("mean_dt", np.full(len(h_unsup["iters"]), np.nan, dtype=float))
+        history["mean_dt"] = np.concatenate([m_pre, np.asarray(m_un, dtype=float)])
         return history
 
     raise ValueError("mode must be 'supervised' or 'unsupervised'")

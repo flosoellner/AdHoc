@@ -565,7 +565,7 @@ def plot_value_analysis_combined(
             Xnp = shock[:, None] * float(s)                               # (d,1)
             Xt = torch.tensor(Xnp.T, dtype=torch.float32, device=device)  # (1,d)
             
-            total, hjb_err, sup_err, _, _ = loss_unified(
+            total, hjb_err, sup_err, _, _, _ = loss_unified(
                 model,
                 (Xt,),
                 mode="unsupervised",
@@ -777,6 +777,7 @@ def plot_training_losses(
     iters=None,
     losses=None,
     label: str = "loss",
+    value_key: str = "loss",
     logy: bool = True,
     color: str | None = None,
     title: str | None = None,
@@ -795,13 +796,15 @@ def plot_training_losses(
     markersize: float = 3.5,
 ):
     """
-    Plot training loss vs rollout index.
+    Plot a per-rollout scalar vs rollout index (default: training loss).
 
-    - **Default** ``smooth=None``: **exact** loss recorded after each epoch/rollout,
+    - **Default** ``smooth=None``: **exact** values recorded after each epoch/rollout,
       connected by **straight line segments** (no markers, no EMA). Spikes are preserved.
     - ``smooth='ema'`` / ``smooth='ma'``: **smoothed** curve that does **not** pass
       through each epoch's value—use only if you want a trend line, not exact logs.
     - Pass ``marker='o'`` etc. to overlay explicit point markers.
+    - Pass ``value_key='mean_dt'`` (and matching ``ylabel`` / ``logy``) to plot mean
+      integrator step size from training history.
     """
     if savepath is None and config is not None and hasattr(config, "system"):
         savepath = f"figures/{config.system}_{plot_name}.pdf"
@@ -812,7 +815,7 @@ def plot_training_losses(
             name_k, h = item
             if batch_size is None and "batch_size" in h:
                 batch_size = int(h["batch_size"])
-            norm_series.append((name_k, h.get("iters"), h.get("loss"), h.get("phase")))
+            norm_series.append((name_k, h.get("iters"), h.get(value_key), h.get("phase")))
         elif len(item) == 3:
             name_k, it_k, lo_k = item
             norm_series.append((name_k, it_k, lo_k, None))
@@ -884,12 +887,15 @@ def plot_training_losses(
 
     if logy:
         ax.set_yscale("log")
+    elif value_key == "mean_dt":
+        ax.ticklabel_format(style="sci", axis="y", scilimits=(0, 0), useMathText=True)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.grid(True, which="both", alpha=0.3)
     ax.legend()
-    # Compensate for left y-axis label: add right margin so plot is centered
-    fig.subplots_adjust(left=0.14, right=0.86, bottom=0.16, top=0.96)
+    # Sci y-axis offset text (×10^n): slight headroom so it is not clipped
+    top_margin = 0.935 if value_key == "mean_dt" else 0.96
+    fig.subplots_adjust(left=0.14, right=0.86, bottom=0.16, top=top_margin)
     _save_fig(fig, _output_path(savepath, config, "plots"))
     return fig, ax
 
@@ -1049,52 +1055,103 @@ def _fmt_tex_num(x):
     return str(x)
 
 
-# Default keys for problem config tables (show_spec, save_config_table)
+# Default keys for Jupyter show_spec (includes system and time horizon)
 DEFAULT_CONFIG_KEYS = [
-    "system", "seed", "n_states", "n_controls", "t1_initial", "nu",
+    "system", "seed", "n_states", "n_controls", "t1_initial", "t1_max", "nu",
     "control_width", "ic_modes", "ic_scale", "ic_basis",
 ]
 
 
+def _config_ic_x0_plain(config) -> str:
+    """Plain-text IC family for thesis config row (matches 'sine + cosine' style)."""
+    basis = getattr(config, "ic_basis", None)
+    if basis == "both":
+        return "sine + cosine"
+    if basis == "sine":
+        return "sine"
+    if basis == "cosine":
+        return "cosine"
+    return "—"
+
+
 def save_config_table(config, savepath="config.tex", keys=None):
-    """Save config table in horizontal format (one row of headers, one row of values)."""
-    keys = keys or DEFAULT_CONFIG_KEYS
-    valid_keys = [k for k in keys if hasattr(config, k)]
-    values = [getattr(config, k) for k in valid_keys]
+    """
+    Save config as a lean thesis tabular.
 
-    formatted_values = []
-    for k, v in zip(valid_keys, values):
-        if k == "system" or k == "ic_basis":
-            formatted_values.append(str(v))
-        elif k in ["seed", "n_states", "n_controls", "ic_modes"]:
-            formatted_values.append(_fmt_tex_num(int(v)))
-        elif k in ["t1_initial", "nu", "control_width", "ic_scale"]:
-            formatted_values.append(_fmt_tex_num(float(v)))
-        else:
-            formatted_values.append(_fmt_tex_num(v) if isinstance(v, (int, float, np.floating)) else str(v))
-
+    Default layout (``keys`` None): seed, n, m, nu, w, K, c, x_0, T_0, T_max.
+    If ``keys`` is passed, use the legacy variable-column layout (for custom exports).
+    """
     full_path = _output_path(savepath, config, "tables")
     os.makedirs(os.path.dirname(full_path) or ".", exist_ok=True)
 
-    header_map = {
-        "system": "system",
-        "seed": "seed",
-        "n_states": "$n$",
-        "n_controls": "$m$",
-        "t1_initial": "$T$",
-        "nu": r"$\nu$",
-        "control_width": r"$w$",
-        "ic_modes": "$K$",
-        "ic_scale": "$c$",
-        "ic_basis": "IC basis",
-        "gamma1": r"$\gamma_1$",
-        "gamma2": r"$\gamma_2$",
-        "R": "$R$",
-    }
-    headers = [header_map.get(k, k) for k in valid_keys]
-    
-    with open(full_path, "w", encoding="utf-8") as f:
+    if keys is not None:
+        valid_keys = [k for k in keys if hasattr(config, k)]
+        values = [getattr(config, k) for k in valid_keys]
+        formatted_values = []
+        for k, v in zip(valid_keys, values):
+            if k == "system" or k == "ic_basis":
+                formatted_values.append(str(v))
+            elif k in ["seed", "n_states", "n_controls", "ic_modes"]:
+                formatted_values.append(_fmt_tex_num(int(v)))
+            elif k in ["t1_initial", "t1_max", "nu", "control_width", "ic_scale"]:
+                formatted_values.append(_fmt_tex_num(float(v)))
+            else:
+                formatted_values.append(_fmt_tex_num(v) if isinstance(v, (int, float, np.floating)) else str(v))
+        header_map = {
+            "system": "system",
+            "seed": "seed",
+            "n_states": "$n$",
+            "n_controls": "$m$",
+            "t1_initial": "$t_0$",
+            "t1_max": r"$t_{\max}$",
+            "nu": r"$\nu$",
+            "control_width": r"$w$",
+            "ic_modes": "$M$",
+            "ic_scale": "$c$",
+            "ic_basis": "IC basis",
+            "gamma1": r"$\gamma_1$",
+            "gamma2": r"$\gamma_2$",
+            "R": "$R$",
+        }
+        headers = [header_map.get(k, k) for k in valid_keys]
         n_cols = len(valid_keys)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(f"\\begin{{tabular}}{{@{{}}{'c' * n_cols}@{{}}}}\n")
+            f.write("\\toprule\n")
+            f.write(" & ".join(headers) + " \\\\\n")
+            f.write("\\midrule\n")
+            f.write(" & ".join(formatted_values) + " \\\\\n")
+            f.write("\\bottomrule\n")
+            f.write("\\end{tabular}\n")
+        return
+
+    headers = [
+        "seed",
+        r"$n$",
+        r"$m$",
+        r"$\nu$",
+        r"$w$",
+        r"$M$",
+        r"$c$",
+        r"$x_0$",
+        r"$t_0$",
+        r"$t_{\max}$",
+    ]
+    x0_plain = _config_ic_x0_plain(config)
+    formatted_values = [
+        _fmt_tex_num(int(config.seed)),
+        _fmt_tex_num(int(config.n_states)),
+        _fmt_tex_num(int(config.n_controls)),
+        _fmt_tex_num(float(config.nu)),
+        _fmt_tex_num(float(config.control_width)),
+        _fmt_tex_num(int(config.ic_modes)),
+        _fmt_tex_num(float(config.ic_scale)),
+        x0_plain.replace("&", r"\&"),
+        _fmt_tex_num(float(config.t1_initial)),
+        _fmt_tex_num(float(config.t1_max)),
+    ]
+    n_cols = len(headers)
+    with open(full_path, "w", encoding="utf-8") as f:
         f.write(f"\\begin{{tabular}}{{@{{}}{'c' * n_cols}@{{}}}}\n")
         f.write("\\toprule\n")
         f.write(" & ".join(headers) + " \\\\\n")
@@ -1200,7 +1257,7 @@ def save_data_summary_table(config, data, savepath="data_summary.tex"):
         "$\\|x\\|$ (max)": [norm_x_max]
     })
 
-def save_params_table(obj, savepath, title="Configuration", keys=None, config=None):
+def save_params_table(obj, savepath, title="Configuration", keys=None, config=None, train_n_cand_tex=None):
     """Generic function to save any object's attributes to a LaTeX table."""
     if keys is None:
         keys = [k for k in obj.__dict__.keys() if not k.startswith('_')]
@@ -1215,7 +1272,7 @@ def save_params_table(obj, savepath, title="Configuration", keys=None, config=No
     
     # Special handling for training config
     if "traincfg" in savepath.lower() or "train" in savepath.lower():
-        _save_train_config_latex(obj, full_path)
+        _save_train_config_latex(obj, full_path, n_cand_tex=train_n_cand_tex)
     else:
         save_dataframe_latex(df, full_path, caption=title, label=f"tab:{Path(savepath).stem}")
 
@@ -1240,7 +1297,7 @@ def save_table_latex(df, savepath, config=None, caption=None, label=None, **to_l
 
 def save_robustness_table_latex(df, savepath, config=None, caption=None, label=None):
     """
-    Save the robustness DataFrame (MultiIndex columns: Stability $S$ / Cost $J$ × c values)
+    Save the robustness DataFrame (MultiIndex columns: Stability / Cost $J$ × c values)
     as a lean LaTeX tabular only (no \\begin{table}). Caller adds table, caption, label.
     Layout: one block of subcolumns for Stability (per c), one for Cost (per c).
     """
@@ -1281,27 +1338,41 @@ def save_robustness_table_latex(df, savepath, config=None, caption=None, label=N
     return df
 
 
-def _save_train_config_latex(cfg, savepath):
-    """Save training config in specific LaTeX format. All numerical values in $...$, power-of-ten for floats. Output is only \\begin{tabular}...\\end{tabular}."""
+def _save_train_config_latex(cfg, savepath, n_cand_tex=None):
+    """
+    Thesis tabular: $E$, $h$, $\\lambda_{\\text{sup}}$, $\\mu$, $|\\mathcal{B}|$,
+    $N_{\\mathrm{cand}}$, $\\Delta t_{\\min}$, $\\Delta t_{\\max}$ ($E$ = unsupervised rollout count).
+
+    ``TrainConfig`` always defines ``dt_min`` / ``dt_max`` (HJB rollout integrator clamps).
+
+    Pass ``n_cand_tex`` to override the $N_{\\mathrm{cand}}$ cell (e.g. ``r'$\\{1,8,\\ldots\\}$'``).
+    """
     os.makedirs(os.path.dirname(savepath) or ".", exist_ok=True)
     
-    epochs_sup = getattr(cfg, 'sup_epochs', 1)
     epochs_unsup = getattr(cfg, 'rollouts', 5)
     horizon = getattr(cfg, 'horizon', 30)
     lr = getattr(cfg, 'unsup_lr', 5e-4)
     lambda_sup = getattr(cfg, 'lambda_sup_base', 0.5)
     batch_size = getattr(cfg, 'batch_size', None)
     n_cand = getattr(cfg, 'n_candidates', getattr(cfg, 'n_cand', None))
-    dt_max = getattr(cfg, 'dt_max', 0.1)
+    dt_min = float(getattr(cfg, "dt_min", 1e-2))
+    dt_max = float(getattr(cfg, "dt_max", 1.0))
     batch_size_tex = _fmt_tex_num(int(batch_size)) if batch_size is not None else "---"
-    n_cand_tex = _fmt_tex_num(int(n_cand)) if n_cand is not None else "---"
+    if n_cand_tex is None:
+        n_cand_tex = _fmt_tex_num(int(n_cand)) if n_cand is not None else "---"
     
     with open(savepath, "w", encoding="utf-8") as f:
         f.write("\\begin{tabular}{@{}cccccccc@{}}\n")
         f.write("\\toprule\n")
-        f.write("$E_{\\mathrm{sup}}$ & $N_{\\mathrm{ro}}$ & $h$ & $\\lambda_{\\text{sup}}$ & $\\mu$ & $|\\mathcal{B}|$ & $n_{\\mathrm{cand}}$ & $\\Delta t_{\\max}$ \\\\\n")
+        f.write(
+            "$E$ & $h$ & $\\lambda_{\\text{sup}}$ & $\\mu$ & $|\\mathcal{B}|$ & $N_{\\mathrm{cand}}$ & "
+            "$\\Delta t_{\\min}$ & $\\Delta t_{\\max}$ \\\\\n"
+        )
         f.write("\\midrule\n")
-        f.write(f"{_fmt_tex_num(int(epochs_sup))} & {_fmt_tex_num(int(epochs_unsup))} & {_fmt_tex_num(int(horizon))} & {_fmt_tex_num(float(lambda_sup))} & {_fmt_tex_num(float(lr))} & {batch_size_tex} & {n_cand_tex} & {_fmt_tex_num(float(dt_max))} \\\\\n")
+        f.write(
+            f"{_fmt_tex_num(int(epochs_unsup))} & {_fmt_tex_num(int(horizon))} & {_fmt_tex_num(float(lambda_sup))} & {_fmt_tex_num(float(lr))} & {batch_size_tex} & {n_cand_tex} & "
+            f"{_fmt_tex_num(dt_min)} & {_fmt_tex_num(dt_max)} \\\\\n"
+        )
         f.write("\\bottomrule\n")
         f.write("\\end{tabular}\n")
 
@@ -1309,6 +1380,8 @@ def _save_train_config_latex(cfg, savepath):
 def show_monte_carlo_results(results_dict, controller_name="Controller", title=None):
     """
     Display Monte Carlo results: controllers as columns, metrics (S, J) as rows.
+
+    Returns ``None`` so Jupyter does not render a second (raw) DataFrame after the styled table.
 
     Parameters
     ----------
@@ -1336,33 +1409,104 @@ def show_monte_carlo_results(results_dict, controller_name="Controller", title=N
         {'selector': 'th', 'props': [('background-color', '#f4f4f4'), ('color', 'black'), ('font-weight', 'bold')]}
     ]))
 
-    return df
+
+def compute_monte_carlo_errors(results_dict):
+    """
+    Standard errors for one controller's ``monte_carlo`` output.
+
+    Returns
+    -------
+    S : float
+        Stability rate in ``[0, 1]``.
+    se_S : float
+        ``sqrt(S * (1-S) / n_MC)`` (Bernoulli SE on S).
+    cost_mean : float
+        Mean cost over successful trajectories (``nan`` if none).
+    se_J : float
+        Sample SE of cost: ``std(costs, ddof=1) / sqrt(n_success)`` (``nan`` if ``n_success < 2``).
+    n_mc : int
+    n_success : int
+    """
+    return _monte_carlo_stats_core(results_dict)
+
+
+def _monte_carlo_stats_core(results_dict):
+    """
+    Stability S = n_success/n_MC with SE = sqrt(S(1-S)/n_MC).
+    Cost mean and SE = sample std of successful costs / sqrt(n_success) (ddof=1).
+    Returns (S, se_S, cost_mean, se_J, n_mc, n_success).
+    """
+    NN_final_times = np.asarray(results_dict["NN_final_times"])
+    NN_costs = np.asarray(results_dict["NN_costs"])
+    converged_mask = np.isfinite(NN_final_times)
+    n_success = int(np.sum(converged_mask))
+    n_mc = int(NN_final_times.size)
+    S = n_success / n_mc if n_mc > 0 else 0.0
+    se_S = float(np.sqrt(S * (1.0 - S) / n_mc)) if n_mc > 0 else 0.0
+    costs_ok = NN_costs[converged_mask]
+    if n_success == 0:
+        cost_mean = np.nan
+        se_J = np.nan
+    else:
+        cost_mean = float(np.mean(costs_ok))
+        if n_success < 2:
+            se_J = np.nan
+        else:
+            se_J = float(np.std(costs_ok, ddof=1) / np.sqrt(n_success))
+    return S, se_S, cost_mean, se_J, n_mc, n_success
+
 
 def _raw_monte_carlo_stats(results_dict):
-    """Extract raw stats (stability, cost_mean) from a single controller's results."""
-    NN_final_times = np.asarray(results_dict['NN_final_times'])
-    NN_costs = np.asarray(results_dict['NN_costs'])
-    converged_mask = np.isfinite(NN_final_times)
-    n_converged = int(np.sum(converged_mask))
-    n_total = len(NN_final_times)
-    stability = n_converged / n_total if n_total > 0 else 0.0
-    cost_mean = np.mean(NN_costs[converged_mask]) if n_converged > 0 else np.nan
-    return stability, cost_mean
+    """Backward-compatible: (stability, cost_mean) only."""
+    S, _, cost_mean, _, _, _ = _monte_carlo_stats_core(results_dict)
+    return S, cost_mean
+
+
+def _format_stability_pm_html(S, se_S):
+    if not np.isfinite(S):
+        return "N/A"
+    return f"{100 * S:.0f} ± {100 * se_S:.0f}%"
+
+
+def _format_cost_pm_html(cost_mean, se_J):
+    if not np.isfinite(cost_mean):
+        return "N/A"
+    if not np.isfinite(se_J) or se_J <= 0:
+        return f"{cost_mean:.2f}"
+    return f"{cost_mean:.2f} ± {se_J:.2f}"
+
+
+def _format_stability_pm_latex(S, se_S):
+    if not np.isfinite(S):
+        return "N/A"
+    return f"${100 * S:.0f} \\pm {100 * se_S:.0f}\\%$"
+
+
+def _format_cost_pm_latex(cost_mean, se_J):
+    if not np.isfinite(cost_mean):
+        return "N/A"
+    if not np.isfinite(se_J) or se_J <= 0:
+        return f"${cost_mean:.2f}$"
+    return f"${cost_mean:.2f} \\pm {se_J:.2f}$"
 
 
 def _compute_monte_carlo_stats(results_dict, controller_name):
-    """Helper to compute display stats for a single controller."""
-    stability, cost_mean = _raw_monte_carlo_stats(results_dict)
+    """Notebook table: stability and cost with standard errors."""
+    S, se_S, cost_mean, se_J, _, _ = _monte_carlo_stats_core(results_dict)
     return {
         "Controller": controller_name,
-        "Stability (S)": f"{stability:.1%}",
-        "Cost J (mean)": f"{cost_mean:.2f}" if np.isfinite(cost_mean) else "N/A",
+        "Stability (S)": _format_stability_pm_html(S, se_S),
+        "Cost J (mean)": _format_cost_pm_html(cost_mean, se_J),
     }
 
 
 def save_monte_carlo_results(results_dict, controller_name="Controller", config=None, 
                             savepath="monte_carlo.tex"):
-    """Save Monte Carlo results to LaTeX table: controllers as columns, S and J as rows."""
+    """Save Monte Carlo results to LaTeX table: controllers as columns, S and J as rows.
+
+    Returns ``None`` so a following ``show_monte_carlo_results`` call does not leave a duplicate
+    DataFrame as the cell's ``Out[n]`` when this runs last.
+    """
     
     if isinstance(results_dict, dict) and 'X0_pool' not in results_dict:
         rows = []
@@ -1375,21 +1519,10 @@ def save_monte_carlo_results(results_dict, controller_name="Controller", config=
     
     full_path = _output_path(savepath, config, "tables")
     _save_monte_carlo_latex(df, full_path)
-    return df
 
 def _save_monte_carlo_latex(df, savepath):
-    """Save Monte Carlo table: controllers as columns, metrics (S, J) as rows."""
+    """Save Monte Carlo table: controllers as columns, metrics (S, J) as rows with ± SE."""
     os.makedirs(os.path.dirname(savepath) or ".", exist_ok=True)
-
-    def fmt_stability(x):
-        if isinstance(x, (float, np.floating)) and not np.isnan(x):
-            return f"${x*100:.0f}\\%$"
-        return "N/A"
-
-    def fmt_float(x, decimals=2):
-        if isinstance(x, (float, np.floating)) and not np.isnan(x):
-            return f"${x:.{decimals}f}$"
-        return "N/A"
 
     models = [_controller_name_to_latex(m) for m in df["Model"]]
     n = len(models)
@@ -1399,18 +1532,18 @@ def _save_monte_carlo_latex(df, savepath):
         f.write("\\toprule\n")
         f.write(" & " + " & ".join(models) + " \\\\\n")
         f.write("\\midrule\n")
-        stab_vals = " & ".join(fmt_stability(v) for v in df["Stability $S$"])
-        f.write(f"Stability $S$ & {stab_vals} \\\\\n")
-        cost_vals = " & ".join(fmt_float(v, decimals=2) for v in df["Cost $J$ (mean)"])
+        stab_vals = " & ".join(str(v) for v in df["Stability"])
+        f.write(f"Stability & {stab_vals} \\\\\n")
+        cost_vals = " & ".join(str(v) for v in df["Cost $J$"])
         f.write(f"Cost $J$ & {cost_vals} \\\\\n")
         f.write("\\bottomrule\n")
         f.write("\\end{tabular}\n")
 
 def _compute_monte_carlo_stats_latex(results_dict, controller_name):
-    """Helper for LaTeX table: returns Model, Stability $S$, Cost $J$ (mean)."""
-    stability, cost_mean = _raw_monte_carlo_stats(results_dict)
+    """LaTeX table cells: pre-formatted $value \\pm SE$ strings."""
+    S, se_S, cost_mean, se_J, _, _ = _monte_carlo_stats_core(results_dict)
     return {
         "Model": controller_name,
-        "Stability $S$": stability,
-        "Cost $J$ (mean)": cost_mean,
+        "Stability": _format_stability_pm_latex(S, se_S),
+        "Cost $J$": _format_cost_pm_latex(cost_mean, se_J),
     }
