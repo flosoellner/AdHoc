@@ -1,0 +1,37 @@
+## Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+.env
+.env.*
+
+## macOS
+.DS_Store
+
+## Jupyter
+.ipynb_checkpoints/
+
+## Results directory (contains all generated outputs)
+results/
+
+## Old directories (to be removed)
+cache_*/
+cache_seed*/
+cache_seed*/**
+cache_hard_ics/
+saved_models/
+figures/
+
+## Model checkpoints (also in results/)
+*.pt
+*.pth
+
